@@ -97,7 +97,7 @@ impl From<Arc<GpuOnlyBuffer>> for crate::render_graph::graph::GraphResourceImpor
         crate::render_graph::graph::GraphResourceImportInfo::Buffer {
             resource: val,
             //TODO let the caller supply the initial access state instead of defaulting to Nothing
-            access_type: vk_sync_fork::AccessType::Nothing,
+            access_types: vec![vk_sync_fork::AccessType::Nothing],
         }
     }
 }

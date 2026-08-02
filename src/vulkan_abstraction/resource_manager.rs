@@ -232,7 +232,10 @@ impl<K: Hash + Eq + Copy + 'static> ResourceManager<K> {
             let (arena, region) = copies[i];
             let (src, handle): (&RawBuffer, _) = match arena {
                 ArenaId::MeshInfo => (self.meshes_info.staging().raw(), self.meshes_info.handle()),
-                ArenaId::EmissiveTriangles => (self.blas_emissive_triangles.staging().raw(), self.blas_emissive_triangles.handle()),
+                ArenaId::EmissiveTriangles => (
+                    self.blas_emissive_triangles.staging().raw(),
+                    self.blas_emissive_triangles.handle(),
+                ),
             };
             let handle = handle.ok_or_else(|| {
                 SrError::new(

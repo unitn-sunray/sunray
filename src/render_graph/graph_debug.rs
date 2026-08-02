@@ -33,20 +33,23 @@ pub(crate) struct ResourceDumpInfo {
     pub detail: String,
     /// Aliasing slot this resource binds to (transient only).
     pub slot: Option<u32>,
-    /// For imported resources: the access the previous frame left it in, which
-    /// drives whether a cross-frame barrier is emitted. `None` for created ones.
-    pub import_access: Option<vk_sync::AccessType>,
+    /// For imported resources: every access the previous frame left it in, which
+    /// `__imports` declares and the first consumer is ordered against. `None` for
+    /// created ones.
+    pub import_access: Option<Vec<vk_sync::AccessType>>,
 }
 
 /// Everything needed to render one frame's graph, gathered by `compile`.
 pub(crate) struct GraphDump<'a> {
     pub frame: u64,
     pub pass_names: Vec<String>,
-    /// (src_pass, dst_pass, barriers-on-this-edge).
-    pub edges: Vec<(usize, usize, &'a [ResourceBarrier])>,
+    /// (src_pass, dst_pass, resources whose hazards forced the ordering).
+    /// Edges express ordering only — barriers belong to a schedule position, not
+    /// to an edge, so they live in `barriers_at`.
+    pub edges: Vec<(usize, usize, &'a [u32])>,
     pub resources: Vec<ResourceDumpInfo>,
-    /// Init + cross-frame barriers issued before any pass (frame entry).
-    pub init_barriers: &'a [ResourceBarrier],
+    /// Barriers issued immediately before each pass, in the order recorded.
+    pub barriers_at: &'a [(usize, Vec<ResourceBarrier>)],
     /// The `TransientResources` aliasing/barrier report (`Debug` output).
     pub aliasing_report: String,
 }
@@ -60,7 +63,13 @@ impl GraphDump<'_> {
     }
 
     fn barrier_label(&self, b: &ResourceBarrier) -> String {
-        format!("{}: {:?}->{:?}", self.res_label(b.resource_id), b.prev_access, b.next_access)
+        format!(
+            "{}: {:?}->{:?}{}",
+            self.res_label(b.resource_id),
+            b.prev,
+            b.next,
+            if b.discard { " [discard]" } else { "" }
+        )
     }
 
     /// Graphviz DOT of passes + dependency edges + a frame-entry node.
@@ -75,20 +84,25 @@ impl GraphDump<'_> {
             let _ = writeln!(s, "  pass_{i} [label=\"pass {i}\\n{}\"];", escape(name));
         }
 
-        // Frame-entry node: init + cross-frame barriers.
-        if !self.init_barriers.is_empty() {
-            let mut lbl = String::from("FRAME ENTRY\\n(init + cross-frame barriers)");
-            for b in self.init_barriers {
+        // Barriers hang off the pass they precede, not off an edge — one note node
+        // per barrier point, drawn into its pass.
+        for (pass, barriers) in self.barriers_at {
+            if barriers.is_empty() {
+                continue;
+            }
+            let mut lbl = format!("barriers before pass {pass}");
+            for b in barriers {
                 let _ = write!(lbl, "\\n{}", escape(&self.barrier_label(b)));
             }
             let _ = writeln!(
                 s,
-                "  frame_entry [shape=note, style=filled, fillcolor=\"#ffe8b3\", label=\"{lbl}\"];"
+                "  barrier_{pass} [shape=note, style=filled, fillcolor=\"#ffe8b3\", label=\"{lbl}\"];"
             );
+            let _ = writeln!(s, "  barrier_{pass} -> pass_{pass} [style=dashed, color=\"#b38f00\"];");
         }
 
-        for (src, dst, barriers) in &self.edges {
-            let label = barriers.iter().map(|b| self.barrier_label(b)).collect::<Vec<_>>().join("\\n");
+        for (src, dst, resources) in &self.edges {
+            let label = resources.iter().map(|r| self.res_label(*r)).collect::<Vec<_>>().join("\\n");
             let _ = writeln!(s, "  pass_{src} -> pass_{dst} [label=\"{}\"];", escape(&label));
         }
         let _ = writeln!(s, "}}");
@@ -107,9 +121,9 @@ impl GraphDump<'_> {
         let _ = writeln!(s, "\nResources (id | kind | detail | slot | cross-frame access):");
         for r in &self.resources {
             let slot = r.slot.map(|s| s.to_string()).unwrap_or_else(|| "-".into());
-            match r.import_access {
-                Some(access) => {
-                    let flag = if access == vk_sync::AccessType::Nothing {
+            match &r.import_access {
+                Some(accesses) => {
+                    let flag = if accesses.iter().all(|a| *a == vk_sync::AccessType::Nothing) {
                         "   <== enters UNDEFINED (contents discarded)"
                     } else {
                         ""
@@ -117,7 +131,7 @@ impl GraphDump<'_> {
                     let _ = writeln!(
                         s,
                         "  {:>3} | {:<16} | {:<28} | slot {:<3} | {:?}{}",
-                        r.id, r.kind, r.detail, slot, access, flag
+                        r.id, r.kind, r.detail, slot, accesses, flag
                     );
                 }
                 None => {
@@ -126,20 +140,27 @@ impl GraphDump<'_> {
             }
         }
 
-        let _ = writeln!(s, "\nDependency edges (src -> dst : barriers):");
-        for (src, dst, barriers) in &self.edges {
+        let _ = writeln!(s, "\nDependency edges — ordering only (src -> dst : resources):");
+        for (src, dst, resources) in &self.edges {
             let _ = writeln!(s, "  pass {src} -> pass {dst}");
-            for b in *barriers {
-                let _ = writeln!(s, "      {}", self.barrier_label(b));
+            for r in *resources {
+                let _ = writeln!(s, "      {}", self.res_label(*r));
             }
         }
 
-        let _ = writeln!(s, "\nInit / cross-frame barriers (frame entry):");
-        if self.init_barriers.is_empty() {
+        let total: usize = self.barriers_at.iter().map(|(_, b)| b.len()).sum();
+        let _ = writeln!(
+            s,
+            "\nBarriers ({total} transitions at {} point(s), in schedule order):",
+            self.barriers_at.len()
+        );
+        if self.barriers_at.is_empty() {
             let _ = writeln!(s, "  (none)");
-        } else {
-            for b in self.init_barriers {
-                let _ = writeln!(s, "  {}", self.barrier_label(b));
+        }
+        for (pass, barriers) in self.barriers_at {
+            let _ = writeln!(s, "  before pass {pass}:");
+            for b in barriers {
+                let _ = writeln!(s, "      {}", self.barrier_label(b));
             }
         }
 

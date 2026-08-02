@@ -55,22 +55,30 @@ pub enum AnyRenderResource {
     ImportedRayTracingAcceleration(Arc<AccelerationStructure>),
 }
 
+/// A resource the graph borrows rather than owns, plus the state it carries
+/// *into* this frame.
+///
+/// `access_types` is a set, not one access, because the previous frame may have
+/// left the resource in a multi-reader epoch. Keeping only one of those readers
+/// makes the next frame's write-after-read barrier name a single source stage,
+/// so the write can begin while the other readers are still running. See
+/// `RenderGraph::plan_barriers`, which produces the set from the final epoch.
 #[derive(Clone)]
 pub enum GraphResourceImportInfo {
     Image {
         resource: Arc<Image>,
-        access_type: vk_sync::AccessType,
+        access_types: Vec<vk_sync::AccessType>,
     },
     Buffer {
         resource: Arc<dyn Buffer>,
-        access_type: vk_sync::AccessType,
+        access_types: Vec<vk_sync::AccessType>,
     },
     Sampler {
         resource: Arc<Sampler>,
     },
     RayTracingAcceleration {
         resource: Arc<AccelerationStructure>,
-        access_type: vk_sync::AccessType,
+        access_types: Vec<vk_sync::AccessType>,
     },
 }
 
@@ -159,7 +167,7 @@ impl From<Arc<AccelerationStructure>> for GraphResourceImportInfo {
         GraphResourceImportInfo::RayTracingAcceleration {
             resource: val,
             //TODO let the caller supply the initial access state instead of defaulting to Nothing
-            access_type: vk_sync::AccessType::Nothing,
+            access_types: vec![vk_sync::AccessType::Nothing],
         }
     }
 }

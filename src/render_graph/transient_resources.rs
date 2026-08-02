@@ -463,14 +463,10 @@ impl TransientResources {
             return;
         }
         let mut image_barriers: Vec<vk_sync::ImageBarrier> = Vec::new();
-        let mut buffer_barriers: Vec<vk_sync::BufferBarrier> = Vec::new();
         let mut global_prev: Vec<vk_sync::AccessType> = Vec::new();
         let mut global_next: Vec<vk_sync::AccessType> = Vec::new();
 
         for b in barriers {
-            let prev_slice = std::slice::from_ref(&b.prev_access);
-            let next_slice = std::slice::from_ref(&b.next_access);
-
             // Image? (transient first, then imported — same resource id can never
             // appear in both maps so the order doesn't matter for correctness).
             let image_info = self
@@ -484,53 +480,45 @@ impl TransientResources {
                 });
 
             if let Some((handle, format)) = image_info {
-                image_barriers.push(vk_sync::ImageBarrier {
-                    previous_accesses: prev_slice,
-                    next_accesses: next_slice,
-                    previous_layout: vk_sync::ImageLayout::Optimal,
-                    next_layout: vk_sync::ImageLayout::Optimal,
-                    discard_contents: false,
-                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    image: handle,
-                    range: vk::ImageSubresourceRange {
-                        aspect_mask: aspect_for(format),
-                        base_mip_level: 0,
-                        level_count: vk::REMAINING_MIP_LEVELS,
-                        base_array_layer: 0,
-                        layer_count: vk::REMAINING_ARRAY_LAYERS,
-                    },
-                });
-                continue;
+                // Only a genuine layout change (or a discard, which forces
+                // oldLayout to UNDEFINED) needs its own image barrier. Everything
+                // else folds into the global one below.
+                let changes_layout = epoch_layout(&b.prev) != epoch_layout(&b.next);
+                if changes_layout || b.discard {
+                    image_barriers.push(vk_sync::ImageBarrier {
+                        previous_accesses: &b.prev,
+                        next_accesses: &b.next,
+                        previous_layout: vk_sync::ImageLayout::Optimal,
+                        next_layout: vk_sync::ImageLayout::Optimal,
+                        discard_contents: b.discard,
+                        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                        image: handle,
+                        range: vk::ImageSubresourceRange {
+                            aspect_mask: aspect_for(format),
+                            base_mip_level: 0,
+                            level_count: vk::REMAINING_MIP_LEVELS,
+                            base_array_layer: 0,
+                            layer_count: vk::REMAINING_ARRAY_LAYERS,
+                        },
+                    });
+                    continue;
+                }
             }
 
-            let buffer_info = self
-                .transient_buffers
-                .get(&b.resource_id)
-                .map(|buf| (buf.inner(), buf.byte_size()))
-                .or_else(|| {
-                    self.external_buffers
-                        .get(&b.resource_id)
-                        .map(|buf| (buf.inner(), buf.byte_size()))
-                });
-
-            if let Some((handle, size)) = buffer_info {
-                buffer_barriers.push(vk_sync::BufferBarrier {
-                    previous_accesses: prev_slice,
-                    next_accesses: next_slice,
-                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    buffer: handle,
-                    offset: 0,
-                    size: size as usize,
-                });
-                continue;
-            }
-
-            // Fallback: AS / sampler / anything else — collapse into a global
-            // barrier so the access ordering is still expressed.
-            global_prev.push(b.prev_access);
-            global_next.push(b.next_access);
+            // Buffers, acceleration structures, samplers, and images whose layout
+            // does not change: all of these need only availability/visibility, which
+            // is exactly what one global memory barrier expresses. Folding them
+            // costs nothing — they were already going into this same
+            // `vkCmdPipelineBarrier2`, which is already a single sync point with one
+            // pair of stage masks — and `vk_sync` ORs the accesses for us.
+            //
+            // ponytail: per-buffer `BufferBarrier`s are gone. They only beat a
+            // global barrier for queue-family ownership transfer; re-add them when
+            // multi-queue needs QFOT, which is the one case where the
+            // buffer/offset/size fields carry information.
+            global_prev.extend_from_slice(&b.prev);
+            global_next.extend_from_slice(&b.next);
         }
 
         let global = if !global_prev.is_empty() {
@@ -542,7 +530,7 @@ impl TransientResources {
             None
         };
 
-        vk_sync::cmd::pipeline_barrier(device, cmd_buffer, global, &buffer_barriers, &image_barriers);
+        vk_sync::cmd::pipeline_barrier(device, cmd_buffer, global, &[], &image_barriers);
     }
 }
 
@@ -665,16 +653,44 @@ impl std::fmt::Debug for TransientResources {
                     } else {
                         "Global"
                     };
+                    let folded = if kind == "Image" && epoch_layout(&b.prev) == epoch_layout(&b.next) && !b.discard {
+                        "  [folded into global]"
+                    } else {
+                        ""
+                    };
                     writeln!(
                         f,
-                        "    res {:>3} ({kind:<11}) {:?} -> {:?}",
-                        b.resource_id, b.prev_access, b.next_access
+                        "    res {:>3} ({kind:<11}) {:?} -> {:?}{}{}",
+                        b.resource_id,
+                        b.prev,
+                        b.next,
+                        if b.discard { "  [discard]" } else { "" },
+                        folded
                     )?;
                 }
             }
         }
         writeln!(f, "==========================================")
     }
+}
+
+/// The `VkImageLayout` an access type implies, as `vk_sync` would pick it for
+/// `ImageLayout::Optimal`.
+///
+/// The graph needs this for two decisions it cannot make otherwise: whether a run
+/// of reads can share one barrier (they must agree on layout — `vk_sync`'s
+/// `get_image_memory_barrier` debug-asserts if they don't), and whether a barrier
+/// changes layout at all, which is the only thing a `VkImageMemoryBarrier2` buys
+/// over the global one.
+pub(crate) fn image_layout_of(access: vk_sync::AccessType) -> vk::ImageLayout {
+    vk_sync::get_access_info(access).image_layout
+}
+
+/// Layout implied by one side of a barrier. Every access in an epoch agrees on
+/// layout by construction (`RenderGraph::plan_barriers` splits a read run when it
+/// wouldn't), so the first one speaks for all.
+fn epoch_layout(accesses: &[vk_sync::AccessType]) -> vk::ImageLayout {
+    accesses.first().map_or(vk::ImageLayout::UNDEFINED, |a| image_layout_of(*a))
 }
 
 /// Pick the right `vk::ImageAspectFlags` for a given format. Used when building

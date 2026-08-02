@@ -8,7 +8,7 @@ use crate::render_graph::pass_builder::{
 pub(crate) use crate::render_graph::resource::{
     GraphResourceDesc, GraphResourceImportInfo, GraphResourceInfo, Handle, Resource, ResourceDesc, RgImportable,
 };
-use crate::render_graph::transient_resources::TransientResources;
+use crate::render_graph::transient_resources::{TransientResources, image_layout_of};
 use crate::vulkan_abstraction::{
     AccelerationStructure, AsBuildJob, Buffer, CmdBuffer, ComputePipeline, Core, GpuOnlyBuffer, GraphicsPipeline,
     GraphicsPipelineShaders, HeapComputePass, Image, Pipeline, QueueRole, RawBuffer, RayTracingPipeline,
@@ -186,27 +186,56 @@ pub struct ResourceEndState {
     pub last_use_pass: Option<usize>,
     /// Access type the resource is left in when the submission completes
     /// (`Nothing` when never used).
-    pub end_access: vk_sync::AccessType,
+    /// Every access of the resource's final epoch — the *whole* epoch, not just
+    /// its last access.
+    ///
+    /// A resource ending in a run of several distinct reads is left in all of
+    /// them. Recording only the last one makes the next frame's
+    /// write-after-read barrier name a single source stage, so the write can
+    /// begin while the other readers are still in flight. Empty means the
+    /// resource was registered but never used.
+    pub end_accesses: Vec<vk_sync::AccessType>,
+    /// The write that produced the current contents, if any.
+    ///
+    /// When the final epoch is a read run, the cross-frame transition into
+    /// another read emits no barrier at all, so nothing else names the producer.
+    /// A queue change needs it for the ownership-transfer acquire's source
+    /// access; it gains a queue role when multi-queue lands.
+    pub last_write: Option<vk_sync::AccessType>,
     /// Graph-created (transient) resource: its backing memory is recycled on
     /// `reset`, so its end state only matters for in-graph aliasing, never to
     /// the caller.
     pub internal: bool,
 }
 
-/// A single transition required before a destination pass can run, derived from
-/// a read/write hazard on `resource_id` against an earlier producer or reader.
+/// The transition between two consecutive access epochs of one resource, to be
+/// issued at the schedule position the epoch walk keyed it to.
+///
+/// `prev` / `next` carry *every* access of the epoch being left and entered, not
+/// one apiece. That is what collapses N reader barriers into one: `vk_sync` ORs
+/// the masks, so a single barrier covers the whole run. All accesses within one
+/// side imply the same image layout by construction (see `plan_barriers`).
 #[derive(Clone, Debug)]
 pub(crate) struct ResourceBarrier {
     pub(crate) resource_id: u32,
-    pub(crate) prev_access: vk_sync::AccessType,
-    pub(crate) next_access: vk_sync::AccessType,
+    pub(crate) prev: Vec<vk_sync::AccessType>,
+    pub(crate) next: Vec<vk_sync::AccessType>,
+    /// Previous contents are undefined — freshly bound transient memory — so the
+    /// transition may discard rather than preserve them.
+    pub(crate) discard: bool,
 }
 
-/// Edge weight on the pass dependency graph: all barriers that must be issued
-/// before the destination pass runs because of the source pass.
+/// Edge weight on the pass dependency graph: the resources whose hazards forced
+/// this ordering.
+///
+/// Edges no longer carry barriers. A barrier belongs to a *position in the
+/// schedule*, not to an edge — several edges can demand the same transition, and
+/// one transition can cover readers spread over several edges. `plan_barriers`
+/// computes them from the per-resource epoch walk instead; the resource ids are
+/// kept only so the graph dump can label the edge.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PassDependency {
-    pub(crate) barriers: Vec<ResourceBarrier>,
+    pub(crate) resources: Vec<u32>,
 }
 
 /// Per-resource lifetime + ordered list of (pass, access) touches. Lifetime is
@@ -223,6 +252,31 @@ pub(crate) struct ResourceLifetimeUsage {
 struct ResourceHazardState {
     last_writer: Option<(usize, vk_sync::AccessType)>,
     readers_since_write: Vec<(usize, vk_sync::AccessType)>,
+}
+
+/// One maximal run of mutually compatible accesses to a single resource: either a
+/// single write, or a run of consecutive reads that all imply the same image
+/// layout. Consecutive epochs are what barriers sit between.
+#[derive(Debug)]
+struct AccessEpoch {
+    /// Every distinct access in the run. Unioned into one side of the barrier.
+    accesses: Vec<vk_sync::AccessType>,
+    /// Schedule position (not pass id) of the first and last pass in the run.
+    first_pass: usize,
+    last_pass: usize,
+    is_write: bool,
+    /// Contents entering this epoch are undefined. Only the synthetic seed epoch
+    /// of a freshly-bound transient image sets it.
+    discard: bool,
+}
+
+/// `Nothing` is neither a read nor a write access, but it means "contents are
+/// undefined and a transition is required", so for epoch purposes it behaves as a
+/// write — it must not merge into a neighbouring read run, and the first real use
+/// must be ordered after it. `__imports` routes it to the write list for the same
+/// reason (`PassCommonDataBuilder::declare_previous_imports`).
+fn starts_write_epoch(access: vk_sync::AccessType) -> bool {
+    access.is_write_access() || access == vk_sync::AccessType::Nothing
 }
 
 /// A weakly-connected component of the dependency graph: a set of passes that
@@ -253,7 +307,7 @@ fn add_dep_edge(
     nodes: &[petgraph::graph::NodeIndex],
     src: usize,
     dst: usize,
-    barrier: ResourceBarrier,
+    res_id: u32,
 ) {
     // A pass that reads-then-writes its own resource produces a self-edge; the hazard
     // is already serialized by the pass itself, so skip it.
@@ -263,14 +317,63 @@ fn add_dep_edge(
     let s = nodes[src];
     let d = nodes[dst];
     if let Some(e) = graph.find_edge(s, d) {
-        graph
-            .edge_weight_mut(e)
-            .expect("edge just found must have a weight")
-            .barriers
-            .push(barrier);
+        let w = graph.edge_weight_mut(e).expect("edge just found must have a weight");
+        if !w.resources.contains(&res_id) {
+            w.resources.push(res_id);
+        }
     } else {
-        graph.add_edge(s, d, PassDependency { barriers: vec![barrier] });
+        graph.add_edge(s, d, PassDependency { resources: vec![res_id] });
     }
+}
+
+/// Topological order of the pass graph, as pass ids.
+///
+/// Kahn's algorithm with the ready set in a min-heap on pass id, so ties break
+/// on declaration order instead of on petgraph's DFS. Determinism is load-bearing
+/// here: `plan_barriers` walks each resource's usages in *this* linearization to
+/// decide where barriers go, and the record loop replays the same order, so the
+/// two must agree exactly and reproducibly.
+///
+/// The ready set is also the natural hook for multi-queue — assigning a pass to a
+/// queue is a choice made at the moment it becomes ready.
+fn kahn_toposort(dep_graph: &petgraph::graph::DiGraph<usize, PassDependency>) -> SrResult<Vec<usize>> {
+    use petgraph::Direction;
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let n = dep_graph.node_count();
+    // `add_dep_edge` merges duplicates, so there are no parallel edges and each
+    // neighbour is counted exactly once.
+    let mut indegree: Vec<usize> = (0..n)
+        .map(|i| {
+            dep_graph
+                .neighbors_directed(petgraph::graph::NodeIndex::new(i), Direction::Incoming)
+                .count()
+        })
+        .collect();
+
+    let mut ready: BinaryHeap<Reverse<usize>> = (0..n).filter(|i| indegree[*i] == 0).map(Reverse).collect();
+    let mut order = Vec::with_capacity(n);
+
+    while let Some(Reverse(i)) = ready.pop() {
+        let node = petgraph::graph::NodeIndex::new(i);
+        order.push(dep_graph[node]);
+        for succ in dep_graph.neighbors_directed(node, Direction::Outgoing) {
+            indegree[succ.index()] -= 1;
+            if indegree[succ.index()] == 0 {
+                ready.push(Reverse(succ.index()));
+            }
+        }
+    }
+
+    // Fewer emitted than nodes ⇒ a cycle. Hazards only ever produce forward
+    // (lower pass id → higher) edges by construction, so this is a logic bug.
+    if order.len() != n {
+        return Err(SrError::new_custom(
+            "render graph dependency graph contains a cycle".to_string(),
+        ));
+    }
+    Ok(order)
 }
 
 /// Graph-owned backing for one temporal (cross-frame) resource: one distinct,
@@ -644,14 +747,14 @@ impl RenderGraph {
                 let image = Arc::new(Image::new_from_desc(self.core(), image_desc)?);
                 Ok(GraphResourceImportInfo::Image {
                     resource: image,
-                    access_type: vk_sync::AccessType::Nothing,
+                    access_types: vec![vk_sync::AccessType::Nothing],
                 })
             }
             GraphResourceDesc::Buffer(buffer_desc) => {
                 let buffer = Arc::new(RawBuffer::new_from_desc(self.core(), buffer_desc)?);
                 Ok(GraphResourceImportInfo::Buffer {
                     resource: buffer,
-                    access_type: vk_sync::AccessType::Nothing,
+                    access_types: vec![vk_sync::AccessType::Nothing],
                 })
             }
             GraphResourceDesc::Sampler(_) | GraphResourceDesc::RaytracingAS(_) => Err(SrError::new_custom(
@@ -696,12 +799,7 @@ impl RenderGraph {
     {
         let desc = res.import();
         let mut import = res.into();
-        match &mut import {
-            GraphResourceImportInfo::Image { access_type, .. }
-            | GraphResourceImportInfo::Buffer { access_type, .. }
-            | GraphResourceImportInfo::RayTracingAcceleration { access_type, .. } => *access_type = usage,
-            GraphResourceImportInfo::Sampler { .. } => {}
-        }
+        set_import_access(&mut import, std::slice::from_ref(&usage));
         self.virtual_resources.push(GraphResourceInfo::Imported(import));
         Handle {
             id: self.next_resource_id(),
@@ -915,21 +1013,26 @@ impl RenderGraph {
         // Samplers are excluded: they have no memory contents, so they never need
         // a barrier — declaring one would only produce a global barrier for an id
         // that resolves to neither an image nor a buffer.
-        let imported: Vec<(u32, AccessType)> = self
+        // Each import contributes *every* access it carries in, so a resource the
+        // previous frame left in a multi-reader epoch re-enters in all of them and
+        // the first write this frame is ordered against all of them.
+        let imported: Vec<(u32, Vec<AccessType>)> = self
             .virtual_resources
             .iter()
             .enumerate()
             .filter_map(|(id, info)| match info {
                 GraphResourceInfo::Imported(GraphResourceImportInfo::Sampler { .. }) => None,
-                GraphResourceInfo::Imported(import) => Some((id as u32, imported_initial_access(import))),
+                GraphResourceInfo::Imported(import) => Some((id as u32, imported_initial_access(import).to_vec())),
                 GraphResourceInfo::Created(_) => None,
             })
             .collect();
 
         if !imported.is_empty() {
             let mut builder = PassCommonDataBuilder::new(self, "__imports");
-            for (id, access) in imported {
-                builder.declare_previous_imports(id, access);
+            for (id, accesses) in imported {
+                for access in accesses {
+                    builder.declare_previous_imports(id, access);
+                }
             }
             internal.push(AnyRenderPass::Internal(builder.build_internal()));
         }
@@ -976,11 +1079,7 @@ impl RenderGraph {
 
         let mut dep_graph = petgraph::graph::DiGraph::<usize, PassDependency>::with_capacity(pass_count, pass_count * 2);
 
-        //Note: acyclic graph ir with phi
-
         let pass_nodes: Vec<petgraph::graph::NodeIndex> = (0..pass_count).map(|i| dep_graph.add_node(i)).collect();
-
-        //TODO let mut initialization_node = AnyRenderPass::Compute();
 
         for (pass_id, pass) in self.passes.iter().enumerate() {
             let common = pass.common();
@@ -989,18 +1088,8 @@ impl RenderGraph {
                 let res_id = read.id;
                 record_usage(&mut resource_usages, res_id, pass_id, read.access);
                 let state = hazard_states.entry(res_id).or_default();
-                if let Some((w_pass, w_access)) = state.last_writer {
-                    add_dep_edge(
-                        &mut dep_graph,
-                        &pass_nodes,
-                        w_pass,
-                        pass_id,
-                        ResourceBarrier {
-                            resource_id: res_id,
-                            prev_access: w_access,
-                            next_access: read.access.access_type,
-                        },
-                    );
+                if let Some((w_pass, _)) = state.last_writer {
+                    add_dep_edge(&mut dep_graph, &pass_nodes, w_pass, pass_id, res_id);
                 }
 
                 state.readers_since_write.push((pass_id, read.access.access_type));
@@ -1011,38 +1100,29 @@ impl RenderGraph {
                 record_usage(&mut resource_usages, res_id, pass_id, write.access);
                 let state = hazard_states.entry(res_id).or_default();
                 if !state.readers_since_write.is_empty() {
-                    for (r_pass, r_access) in &state.readers_since_write {
-                        add_dep_edge(
-                            &mut dep_graph,
-                            &pass_nodes,
-                            *r_pass,
-                            pass_id,
-                            ResourceBarrier {
-                                resource_id: res_id,
-                                prev_access: *r_access,
-                                next_access: write.access.access_type,
-                            },
-                        );
+                    for (r_pass, _) in &state.readers_since_write {
+                        add_dep_edge(&mut dep_graph, &pass_nodes, *r_pass, pass_id, res_id);
                     }
-                } else if let Some((w_pass, w_access)) = state.last_writer {
-                    add_dep_edge(
-                        &mut dep_graph,
-                        &pass_nodes,
-                        w_pass,
-                        pass_id,
-                        ResourceBarrier {
-                            resource_id: res_id,
-                            prev_access: w_access,
-                            next_access: write.access.access_type,
-                        },
-                    );
+                } else if let Some((w_pass, _)) = state.last_writer {
+                    add_dep_edge(&mut dep_graph, &pass_nodes, w_pass, pass_id, res_id);
                 }
                 state.last_writer = Some((pass_id, write.access.access_type));
                 state.readers_since_write.clear();
             }
         }
 
-        self.set_resources_end_states(&mut resource_usages);
+        // Linearize first: the epoch walk groups each resource's usages in
+        // *schedule* order, and the record loop below replays the same order.
+        let topo = kahn_toposort(&dep_graph)?;
+        let mut schedule_pos = vec![0usize; pass_count];
+        for (pos, pass_id) in topo.iter().enumerate() {
+            schedule_pos[*pass_id] = pos;
+        }
+
+        // Epoch walk: every barrier this frame issues, keyed to the pass it must
+        // precede, plus each resource's end state.
+        let (mut barriers_at, end_states) = Self::plan_barriers(&self.virtual_resources, &resource_usages, &schedule_pos);
+        self.resource_end_states = end_states;
 
         // Cross-frame sync for temporal (ping-pong / history) resources: thread
         // each backing's end access this frame back into its stored import, so
@@ -1055,7 +1135,7 @@ impl RenderGraph {
         // explicitly via `Tlas::queue_build`; temporal resources get it here.
         for &(ti, ci, rid) in &self.registered_temporal {
             if let Some(end) = self.resource_end_states.get(&rid) {
-                set_import_access(&mut self.temporal_resources[ti].imports[ci], end.end_access);
+                set_import_access(&mut self.temporal_resources[ti].imports[ci], &end.end_accesses);
             }
         }
 
@@ -1092,23 +1172,6 @@ impl RenderGraph {
 
         self.transient_resources[slot].populate(Rc::clone(&self.core), &self.virtual_resources, &components, &resource_usages)?;
 
-        // Topological order of passes. petgraph's toposort fails iff there is a
-        // cycle, which would be a logic bug since hazards only ever produce
-        // forward (lower pass_id → higher pass_id) edges by construction.
-        let topo = petgraph::algo::toposort(&dep_graph, None)
-            .map_err(|_| SrError::new_custom("render graph dependency graph contains a cycle".to_string()))?;
-
-        // Pre-group all barriers by the pass that needs them issued *before* it
-        // runs. Each dep edge contributes its barriers to the destination pass.
-        let mut incoming: HashMap<usize, Vec<ResourceBarrier>> = HashMap::new();
-        for edge in dep_graph.edge_references() {
-            let dst = dep_graph[edge.target()];
-            incoming
-                .entry(dst)
-                .or_default()
-                .extend(edge.weight().barriers.iter().cloned());
-        }
-
         let device = self.core.device().inner().clone();
         // This slot's command buffer was allocated in `RenderGraph::new`. Reset it
         // before re-recording — the pool was created with `RESET_COMMAND_BUFFER`,
@@ -1119,44 +1182,6 @@ impl RenderGraph {
         unsafe {
             device.reset_command_buffer(raw_cb, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(raw_cb, &vk::CommandBufferBeginInfo::default())?;
-        }
-
-        // Initial layout transitions for created (transient) images. Their memory
-        // is freshly bound this frame, so the image is in UNDEFINED; the first
-        // pass that touches one accesses it through a storage/sampled descriptor
-        // that requires GENERAL / SHADER_READ_ONLY. The hazard graph only emits
-        // producer->consumer barriers, so a created image that is *written first*
-        // (the common case: an RT/compute pass producing it) would otherwise be
-        // accessed while still UNDEFINED. Discard-transition each one up front to
-        // the layout implied by its first access. Imported resources are excluded:
-        // they carry a layout from outside the graph (or across frames).
-        let mut init_barriers: Vec<ResourceBarrier> = Vec::new();
-        for (res_id, usage) in &resource_usages {
-            let is_created_image = matches!(
-                self.virtual_resources.get(*res_id as usize),
-                Some(GraphResourceInfo::Created(GraphResourceDesc::Image(_)))
-            );
-            if !is_created_image {
-                continue;
-            }
-            if let Some((_, first_access)) = usage.usages.first() {
-                init_barriers.push(ResourceBarrier {
-                    resource_id: *res_id,
-                    prev_access: vk_sync::AccessType::Nothing,
-                    next_access: first_access.access_type,
-                });
-            }
-        }
-
-        // Cross-frame init barriers for *imported* resources used to be fabricated
-        // here. They are now ordinary declarations on the `__imports` node
-        // (`build_internal_passes`), so the hazard scan emits them like any other
-        // producer→consumer transition — including the case this loop could not
-        // express, where an import entered as a read and is read again and needs
-        // no barrier at all.
-
-        if !init_barriers.is_empty() {
-            self.transient_resources[slot].emit_barriers(&device, raw_cb, &init_barriers);
         }
 
         // Pass names, gathered up front (the loop borrows `self.passes` mutably):
@@ -1183,10 +1208,8 @@ impl RenderGraph {
         // Drive each pass in topological order. We borrow `self.passes` mutably
         // (closures are FnMut) but only `self.transient_resources` immutably, so
         // the disjoint-field split borrow is fine.
-        for node in &topo {
-            let pass_id = dep_graph[*node];
-
-            if let Some(barriers) = incoming.remove(&pass_id) {
+        for &pass_id in &topo {
+            if let Some(barriers) = barriers_at.remove(&pass_id) {
                 self.transient_resources[slot].emit_barriers(&device, raw_cb, &barriers);
                 self.transient_resources[slot].recorded_barriers.push((pass_id, barriers));
             }
@@ -1233,34 +1256,155 @@ impl RenderGraph {
         // enabled by setting `SUNRAY_GRAPH_DUMP_DIR`. Cheap gate: only builds the
         // dump when the env var is present.
         if let Ok(dir) = std::env::var("SUNRAY_GRAPH_DUMP_DIR") {
-            self.dump_graph(&dir, &pass_names, &dep_graph, &init_barriers, slot);
+            self.dump_graph(&dir, &pass_names, &dep_graph, slot);
         }
 
         Ok(())
     }
-    /// Export the end state of every resource: the last pass that touches it
-    /// and the access it is left in when the submission completes. Usages are
-    /// recorded in pass-id order, so the last entry is the latest pass.
-    /// TODO(temp impl): nothing consumes these yet — see `ResourceEndState`
-    /// for the intended pass-to-pass cross-submission sync.
-    fn set_resources_end_states(&mut self, resource_usages: &mut BTreeMap<u32, ResourceLifetimeUsage>) {
-        self.resource_end_states.clear();
-        for (res_id, info) in self.virtual_resources.iter().enumerate() {
+    /// Group every resource's usages into access epochs and derive, from the
+    /// transitions between them, the minimum set of barriers plus each resource's
+    /// end state. This replaces emitting one barrier per hazard.
+    ///
+    /// Returns barriers keyed by the pass they must be issued *before* — a
+    /// position in the schedule, never a graph edge. Two different resources whose
+    /// transitions land on the same pass are merged into one
+    /// `vkCmdPipelineBarrier2` by `TransientResources::emit_barriers`.
+    ///
+    /// `schedule_pos` maps pass id → index in the topological order. Usages are
+    /// recorded in pass-id order, which is *not* necessarily schedule order, so
+    /// they are re-sorted before grouping.
+    ///
+    /// Placement is the last legal point (immediately before the first pass of the
+    /// epoch being entered). Moving a barrier earlier could merge more of them —
+    /// see the interval-stabbing note in the plan — but it would add an ordering
+    /// constraint that was not otherwise implied, so it is deliberately not done.
+    fn plan_barriers(
+        virtual_resources: &[GraphResourceInfo],
+        resource_usages: &BTreeMap<u32, ResourceLifetimeUsage>,
+        schedule_pos: &[usize],
+    ) -> (HashMap<usize, Vec<ResourceBarrier>>, HashMap<u32, ResourceEndState>) {
+        let mut barriers_at: HashMap<usize, Vec<ResourceBarrier>> = HashMap::new();
+        let mut end_states: HashMap<u32, ResourceEndState> = HashMap::new();
+
+        for (res_id, info) in virtual_resources.iter().enumerate() {
             let res_id = res_id as u32;
             let internal = matches!(info, GraphResourceInfo::Created(_));
-            let (last_use_pass, end_access) = match resource_usages.get(&res_id).and_then(|u| u.usages.last()) {
-                Some((pass, access)) => (Some(*pass), access.access_type),
-                None => (None, vk_sync::AccessType::Nothing),
+            let is_image = matches!(
+                info,
+                GraphResourceInfo::Created(GraphResourceDesc::Image(_))
+                    | GraphResourceInfo::Imported(GraphResourceImportInfo::Image { .. })
+            );
+
+            let mut epochs: Vec<AccessEpoch> = Vec::new();
+
+            // A created image's memory is bound fresh this frame, so it starts
+            // UNDEFINED and its first use needs a discarding transition. Seeding the
+            // walk replaces the standalone init-barrier loop: the transition now
+            // falls out as an ordinary epoch boundary, placed before the first
+            // consumer instead of all up front. Imports need no seed — `__imports`
+            // declared their incoming access as a real usage.
+            //
+            // ponytail: created *buffers* are not seeded, matching the previous
+            // behaviour (there are none today). Note that neither seeds an
+            // alias-reuse barrier — a transient resource reusing another's memory
+            // slot has an unhandled hazard against the previous occupant, which
+            // predates this change and is out of scope here.
+            if matches!(info, GraphResourceInfo::Created(GraphResourceDesc::Image(_))) {
+                epochs.push(AccessEpoch {
+                    accesses: vec![vk_sync::AccessType::Nothing],
+                    // Sentinel: the seed precedes every real pass, so it can never
+                    // collide with one in the same-pass check below.
+                    first_pass: usize::MAX,
+                    last_pass: usize::MAX,
+                    is_write: true,
+                    discard: true,
+                });
+            }
+
+            if let Some(usage) = resource_usages.get(&res_id) {
+                // Stable sort by schedule position keeps a pass's reads ahead of its
+                // writes (the hazard scan records them in that order).
+                let mut ordered: Vec<(usize, vk_sync::AccessType)> =
+                    usage.usages.iter().map(|(p, a)| (*p, a.access_type)).collect();
+                ordered.sort_by_key(|(pass, _)| schedule_pos[*pass]);
+
+                for (pass, access) in ordered {
+                    if starts_write_epoch(access) {
+                        epochs.push(AccessEpoch {
+                            accesses: vec![access],
+                            first_pass: pass,
+                            last_pass: pass,
+                            is_write: true,
+                            discard: false,
+                        });
+                        continue;
+                    }
+                    // A read extends the current read run, but only while every
+                    // access in the run implies the same image layout — `vk_sync`
+                    // asserts on a barrier whose accesses disagree, and merging
+                    // across a layout change is meaningless anyway.
+                    let extends = epochs
+                        .last()
+                        .is_some_and(|e| !e.is_write && (!is_image || image_layout_of(e.accesses[0]) == image_layout_of(access)));
+                    if extends {
+                        let e = epochs.last_mut().expect("checked non-empty");
+                        if !e.accesses.contains(&access) {
+                            e.accesses.push(access);
+                        }
+                        e.last_pass = pass;
+                    } else {
+                        epochs.push(AccessEpoch {
+                            accesses: vec![access],
+                            first_pass: pass,
+                            last_pass: pass,
+                            is_write: false,
+                            discard: false,
+                        });
+                    }
+                }
+            }
+
+            for i in 1..epochs.len() {
+                let (prev, next) = (&epochs[i - 1], &epochs[i]);
+                // Both epochs inside one pass: a pass that reads then writes its own
+                // resource serializes that itself, exactly as the self-edge skip in
+                // `add_dep_edge` assumes.
+                if next.first_pass == prev.last_pass {
+                    continue;
+                }
+                barriers_at.entry(next.first_pass).or_default().push(ResourceBarrier {
+                    resource_id: res_id,
+                    prev: prev.accesses.clone(),
+                    next: next.accesses.clone(),
+                    discard: prev.discard,
+                });
+            }
+
+            // End state comes from the last *real* epoch, carrying all of its
+            // accesses — a final read run leaves the resource in every one of them.
+            // A resource holding only the synthetic seed was never used.
+            let is_real = |e: &AccessEpoch| e.last_pass != usize::MAX;
+            let (last_use_pass, end_accesses) = match epochs.iter().rev().find(|e| is_real(e)) {
+                Some(e) => (Some(e.last_pass), e.accesses.clone()),
+                None => (None, Vec::new()),
             };
-            self.resource_end_states.insert(
+            let last_write = epochs
+                .iter()
+                .rev()
+                .find(|e| e.is_write && is_real(e))
+                .and_then(|e| e.accesses.last().copied());
+            end_states.insert(
                 res_id,
                 ResourceEndState {
                     last_use_pass,
-                    end_access,
+                    end_accesses,
+                    last_write,
                     internal,
                 },
             );
         }
+
+        (barriers_at, end_states)
     }
 
     /// Return a `'static` checkpoint marker for `name`, leaking a fresh
@@ -1283,7 +1427,6 @@ impl RenderGraph {
         dir: &str,
         pass_names: &[String],
         dep_graph: &petgraph::graph::DiGraph<usize, PassDependency>,
-        init_barriers: &[ResourceBarrier],
         slot: usize,
     ) {
         use crate::render_graph::graph_debug::{GraphDump, ResourceDumpInfo};
@@ -1307,7 +1450,7 @@ impl RenderGraph {
                     GraphResourceInfo::Created(GraphResourceDesc::Sampler(_)) => ("created-sampler", String::new(), None),
                     GraphResourceInfo::Created(GraphResourceDesc::RaytracingAS(_)) => ("created-as", String::new(), None),
                     GraphResourceInfo::Imported(import) => {
-                        let access = Some(imported_initial_access(import));
+                        let access = Some(imported_initial_access(import).to_vec());
                         match import {
                             GraphResourceImportInfo::Image { resource, .. } => {
                                 let e = resource.extent();
@@ -1331,9 +1474,9 @@ impl RenderGraph {
             })
             .collect();
 
-        let edges: Vec<(usize, usize, &[ResourceBarrier])> = dep_graph
+        let edges: Vec<(usize, usize, &[u32])> = dep_graph
             .edge_references()
-            .map(|e| (dep_graph[e.source()], dep_graph[e.target()], e.weight().barriers.as_slice()))
+            .map(|e| (dep_graph[e.source()], dep_graph[e.target()], e.weight().resources.as_slice()))
             .collect();
 
         let dump = GraphDump {
@@ -1341,7 +1484,9 @@ impl RenderGraph {
             pass_names: pass_names.to_vec(),
             edges,
             resources,
-            init_barriers,
+            // The record loop already collected every barrier it issued, in
+            // schedule order, so the dump reuses that rather than a second copy.
+            barriers_at: &transient.recorded_barriers,
             aliasing_report: format!("{transient:?}"),
         };
         dump.write_to(dir);
@@ -1418,10 +1563,13 @@ impl RenderGraph {
         let raw_cb = self.cmd_buffers[slot].inner();
         let device = self.core.device().inner().clone();
 
-        let src_end = self
+        // The whole final epoch: if the graph left `source` in several reads, all
+        // of them have to be named as the source of the transition to TRANSFER_READ.
+        let src_end: Vec<vk_sync::AccessType> = self
             .end_state(source)
-            .map(|e| e.end_access)
-            .unwrap_or(vk_sync::AccessType::Nothing);
+            .map(|e| e.end_accesses.clone())
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| vec![vk_sync::AccessType::Nothing]);
         let src_img = self.transient_resources[slot].image(source)?;
         let src_vk = src_img.inner();
         let src_fmt = src_img.format();
@@ -1435,13 +1583,12 @@ impl RenderGraph {
             base_array_layer: 0,
             layer_count: vk::REMAINING_ARRAY_LAYERS,
         };
-        // `previous_accesses` takes a slice, so `src_end` needs a local backing it.
-        let src_prev = [src_end];
+        let src_prev = src_end.as_slice();
 
         // 1. source → TRANSFER_SRC, swapchain UNDEFINED → TRANSFER_DST (discard).
         let pre = [
             vk_sync::ImageBarrier {
-                previous_accesses: &src_prev,
+                previous_accesses: src_prev,
                 next_accesses: &[vk_sync::AccessType::TransferRead],
                 previous_layout: vk_sync::ImageLayout::Optimal,
                 next_layout: vk_sync::ImageLayout::Optimal,
@@ -1489,7 +1636,7 @@ impl RenderGraph {
             },
             vk_sync::ImageBarrier {
                 previous_accesses: &[vk_sync::AccessType::TransferRead],
-                next_accesses: &src_prev,
+                next_accesses: src_prev,
                 previous_layout: vk_sync::ImageLayout::Optimal,
                 next_layout: vk_sync::ImageLayout::Optimal,
                 discard_contents: false,
@@ -1545,23 +1692,26 @@ impl RenderGraph {
 /// previous frame's submission left it in, threaded back by the caller through the
 /// import's `access_type`. Used to seed cross-frame init barriers (see `compile`).
 /// Samplers and swapchain images carry no meaningful cross-frame access.
-fn imported_initial_access(import: &GraphResourceImportInfo) -> vk_sync::AccessType {
+fn imported_initial_access(import: &GraphResourceImportInfo) -> &[vk_sync::AccessType] {
     match import {
-        GraphResourceImportInfo::Image { access_type, .. } => *access_type,
-        GraphResourceImportInfo::Buffer { access_type, .. } => *access_type,
-        GraphResourceImportInfo::RayTracingAcceleration { access_type, .. } => *access_type,
-        GraphResourceImportInfo::Sampler { .. } => vk_sync::AccessType::Nothing,
+        GraphResourceImportInfo::Image { access_types, .. } => access_types,
+        GraphResourceImportInfo::Buffer { access_types, .. } => access_types,
+        GraphResourceImportInfo::RayTracingAcceleration { access_types, .. } => access_types,
+        GraphResourceImportInfo::Sampler { .. } => &[],
     }
 }
 
 /// Overwrite the carried cross-frame access of an import (no-op for the variants
 /// that don't track one). Used to thread a temporal backing's end-of-frame
 /// access into next frame's compile — see the write-back loop in `compile`.
-fn set_import_access(import: &mut GraphResourceImportInfo, access: vk_sync::AccessType) {
+fn set_import_access(import: &mut GraphResourceImportInfo, accesses: &[vk_sync::AccessType]) {
     match import {
-        GraphResourceImportInfo::Image { access_type, .. } => *access_type = access,
-        GraphResourceImportInfo::Buffer { access_type, .. } => *access_type = access,
-        GraphResourceImportInfo::RayTracingAcceleration { access_type, .. } => *access_type = access,
+        GraphResourceImportInfo::Image { access_types, .. }
+        | GraphResourceImportInfo::Buffer { access_types, .. }
+        | GraphResourceImportInfo::RayTracingAcceleration { access_types, .. } => {
+            access_types.clear();
+            access_types.extend_from_slice(accesses);
+        }
         GraphResourceImportInfo::Sampler { .. } => {}
     }
 }
@@ -1637,6 +1787,203 @@ mod tests {
             last_pass: last,
             usages: vec![],
         }
+    }
+
+    // ── Epoch-walk tests ────────────────────────────────────────────────────
+    // `plan_barriers` is a free function over plain data, so these need no
+    // Vulkan device — descs are inert structs.
+
+    /// Build a `ResourceLifetimeUsage` from `(pass, access)` pairs.
+    fn usages(list: &[(usize, AccessType)]) -> ResourceLifetimeUsage {
+        ResourceLifetimeUsage {
+            first_pass: list.first().map_or(0, |(p, _)| *p),
+            last_pass: list.last().map_or(0, |(p, _)| *p),
+            usages: list
+                .iter()
+                .map(|(p, a)| {
+                    (
+                        *p,
+                        PassResourceAccessType {
+                            access_type: *a,
+                            sync_type: PassResourceAccessSyncType::AlwaysSync,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Identity schedule: pass id == schedule position.
+    fn identity_schedule(n: usize) -> Vec<usize> {
+        (0..n).collect()
+    }
+
+    /// A write followed by a run of three distinct reads followed by a write
+    /// collapses to **two** barriers, not four: one RAW carrying the union of the
+    /// three read accesses, one WAR carrying that same union as its source.
+    ///
+    /// The WAR source union is the correctness half — dropping readers from it is
+    /// the race where a write starts while earlier readers are still in flight.
+    #[test]
+    fn epoch_walk_merges_a_reader_run() {
+        let resources = vec![GraphResourceInfo::Created(GraphResourceDesc::Buffer(buffer(1024, "buf")))];
+        let mut u = BTreeMap::new();
+        u.insert(
+            0,
+            usages(&[
+                (1, AccessType::ComputeShaderWrite),
+                (2, AccessType::ComputeShaderReadOther),
+                (3, AccessType::RayTracingShaderReadOther),
+                (4, AccessType::AnyShaderReadOther),
+                (5, AccessType::ComputeShaderWrite),
+            ]),
+        );
+
+        let (barriers, ends) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(6));
+
+        let total: usize = barriers.values().map(|v| v.len()).sum();
+        assert_eq!(total, 2, "W,R,R,R,W must produce 2 barriers, got {barriers:#?}");
+
+        // RAW: before the *first* reader, carrying every reader's access.
+        let raw = &barriers[&2][0];
+        assert_eq!(raw.prev, vec![AccessType::ComputeShaderWrite]);
+        assert_eq!(
+            raw.next,
+            vec![
+                AccessType::ComputeShaderReadOther,
+                AccessType::RayTracingShaderReadOther,
+                AccessType::AnyShaderReadOther
+            ],
+            "RAW dst must cover the whole read run"
+        );
+
+        // WAR: before the writer, sourced from every reader.
+        let war = &barriers[&5][0];
+        assert_eq!(war.prev.len(), 3, "WAR src must cover all 3 readers, not just the last");
+        assert_eq!(war.next, vec![AccessType::ComputeShaderWrite]);
+
+        assert_eq!(ends[&0].last_use_pass, Some(5));
+    }
+
+    /// A read run only merges while the reads agree on image layout. Sampled and
+    /// storage reads do not, so the run splits and a third barrier appears —
+    /// without the split, `vk_sync` would debug-assert on conflicting layouts.
+    #[test]
+    fn read_run_splits_on_layout_change() {
+        let resources = vec![GraphResourceInfo::Created(GraphResourceDesc::Image(image(64, "img")))];
+        let mut u = BTreeMap::new();
+        u.insert(
+            0,
+            usages(&[
+                (1, AccessType::ComputeShaderWrite),
+                (2, AccessType::ComputeShaderReadOther), // GENERAL
+                (3, AccessType::ComputeShaderReadSampledImageOrUniformTexelBuffer), // SHADER_READ_ONLY
+            ]),
+        );
+
+        let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(4));
+
+        // seed->write, write->read(GENERAL), read(GENERAL)->read(SHADER_READ_ONLY)
+        let total: usize = barriers.values().map(|v| v.len()).sum();
+        assert_eq!(total, 3, "layout-incompatible reads must not share an epoch: {barriers:#?}");
+        assert_eq!(barriers[&3][0].prev, vec![AccessType::ComputeShaderReadOther]);
+        assert_eq!(
+            barriers[&3][0].next,
+            vec![AccessType::ComputeShaderReadSampledImageOrUniformTexelBuffer]
+        );
+    }
+
+    /// A created image is seeded UNDEFINED, so its first use gets a discarding
+    /// transition placed before that use — not batched up front, and not emitted
+    /// for imported resources (whose incoming access `__imports` declares).
+    #[test]
+    fn created_image_is_seeded_with_a_discard() {
+        let resources = vec![GraphResourceInfo::Created(GraphResourceDesc::Image(image(64, "img")))];
+        let mut u = BTreeMap::new();
+        u.insert(0, usages(&[(3, AccessType::ComputeShaderWrite)]));
+
+        let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(4));
+
+        assert_eq!(barriers.len(), 1);
+        let b = &barriers[&3][0];
+        assert!(b.discard, "freshly bound transient memory must discard");
+        assert_eq!(b.prev, vec![AccessType::Nothing]);
+    }
+
+    /// Two resources whose transitions land on the same pass are keyed to the same
+    /// position, which is the precondition for `emit_barriers` folding them into a
+    /// single `vkCmdPipelineBarrier2`. This is the reduction that lowers the call
+    /// count, so it is checked separately from the epoch merge above.
+    #[test]
+    fn transitions_on_the_same_pass_share_a_barrier_point() {
+        let resources = vec![
+            GraphResourceInfo::Created(GraphResourceDesc::Buffer(buffer(1024, "a"))),
+            GraphResourceInfo::Created(GraphResourceDesc::Buffer(buffer(2048, "b"))),
+        ];
+        let mut u = BTreeMap::new();
+        // Both written at 1 and 2 respectively, both read at 5.
+        u.insert(
+            0,
+            usages(&[(1, AccessType::ComputeShaderWrite), (5, AccessType::ComputeShaderReadOther)]),
+        );
+        u.insert(
+            1,
+            usages(&[(2, AccessType::ComputeShaderWrite), (5, AccessType::ComputeShaderReadOther)]),
+        );
+
+        let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(6));
+
+        assert_eq!(barriers.len(), 1, "both transitions belong at pass 5");
+        assert_eq!(barriers[&5].len(), 2, "one per resource, merged at emission");
+    }
+
+    /// A resource left in a run of three distinct reads must export all three, not
+    /// just the last. Exporting one makes next frame's write-after-read barrier
+    /// name a single source stage, so the write can start while the other two
+    /// readers are still running — a real race, and the reason `end_accesses` is a
+    /// set. `last_write` still names the producer, which a read-run epoch's
+    /// barrier-free cross-frame transition would otherwise lose.
+    #[test]
+    fn end_state_exports_the_whole_final_read_run() {
+        let resources = vec![GraphResourceInfo::Created(GraphResourceDesc::Buffer(buffer(512, "buf")))];
+        let mut u = BTreeMap::new();
+        u.insert(
+            0,
+            usages(&[
+                (1, AccessType::ComputeShaderWrite),
+                (2, AccessType::ComputeShaderReadOther),
+                (3, AccessType::RayTracingShaderReadOther),
+                (4, AccessType::AnyShaderReadOther),
+            ]),
+        );
+
+        let (_, ends) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(5));
+        let end = &ends[&0];
+
+        assert_eq!(end.end_accesses.len(), 3, "all three trailing readers must be exported");
+        assert!(end.end_accesses.contains(&AccessType::ComputeShaderReadOther));
+        assert!(end.end_accesses.contains(&AccessType::RayTracingShaderReadOther));
+        assert!(end.end_accesses.contains(&AccessType::AnyShaderReadOther));
+        assert_eq!(end.last_write, Some(AccessType::ComputeShaderWrite));
+        assert_eq!(end.last_use_pass, Some(4));
+    }
+
+    /// The fold decision in `emit_barriers` is "does the layout actually change".
+    /// Storage-image accesses all resolve to GENERAL and therefore fold into the
+    /// global barrier; a sampled read does not.
+    #[test]
+    fn layout_query_drives_the_fold() {
+        use crate::render_graph::transient_resources::image_layout_of;
+        assert_eq!(
+            image_layout_of(AccessType::General),
+            image_layout_of(AccessType::ComputeShaderReadOther),
+            "General->ComputeShaderReadOther changes no layout, so it must fold"
+        );
+        assert_ne!(
+            image_layout_of(AccessType::General),
+            image_layout_of(AccessType::ComputeShaderReadSampledImageOrUniformTexelBuffer),
+            "a sampled read needs a real image barrier"
+        );
     }
 
     /// Exercises `TransientResources::populate` on a hand-built set of virtual

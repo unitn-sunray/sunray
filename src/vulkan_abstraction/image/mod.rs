@@ -78,7 +78,7 @@ impl From<Arc<Image>> for GraphResourceImportInfo {
         GraphResourceImportInfo::Image {
             resource: val,
             //TODO let the caller supply the initial access state instead of defaulting to Nothing
-            access_type: vk_sync::AccessType::Nothing,
+            access_types: vec![vk_sync::AccessType::Nothing],
         }
     }
 }
