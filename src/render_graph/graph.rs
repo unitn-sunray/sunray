@@ -395,11 +395,8 @@ impl RenderGraph {
     }
 
     /// Hand the graph a batch of arena staging→GPU buffer copies to record as a
-    /// transfer prologue at the head of this frame's submission (before any pass),
-    /// followed by a transfer→shader-read barrier. The arena buffers are
-    /// program-lifetime with CPU-side frame ring buffering and are only reached by
-    /// device address in shaders, so they are *not* tracked as graph resources —
-    /// this only guarantees the copy is ordered before the reads.
+    /// transfer prologue pass. Each destination is an arena buffer imported into
+    /// *this* build (see `ResourceManager::import_to_graph`).
     pub fn add_prologue_buffer_copies(
         &mut self,
         mut copies: Vec<(

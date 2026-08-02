@@ -1,4 +1,3 @@
-use std::cell::OnceCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -32,7 +31,7 @@ pub struct ArenaGpuBuffer<T: Copy> {
     free_slots: Vec<usize>,
     pending_free_slots: VecDeque<(u64, usize)>,
     core: Rc<vulkan_abstraction::Core>,
-    handle: OnceCell<Handle<RawBuffer>>,
+    handle: Option<Handle<RawBuffer>>,
 }
 
 impl<T: Copy> Buffer for ArenaGpuBuffer<T> {
@@ -74,7 +73,7 @@ impl<T: Copy> Buffer for ArenaGpuBuffer<T> {
             free_slots: vec![],
             pending_free_slots: VecDeque::new(),
             core,
-            handle: OnceCell::new(),
+            handle: None,
         }
     }
 }
@@ -127,7 +126,7 @@ impl<T: Copy> ArenaGpuBuffer<T> {
             free_slots,
             pending_free_slots: VecDeque::new(),
             core,
-            handle: OnceCell::new(),
+            handle: None,
         })
     }
 
@@ -171,7 +170,7 @@ impl<T: Copy> ArenaGpuBuffer<T> {
             free_slots: vec![],
             pending_free_slots: VecDeque::new(),
             core,
-            handle: OnceCell::new(),
+            handle: None,
         })
     }
 
@@ -224,12 +223,20 @@ impl<T: Copy> ArenaGpuBuffer<T> {
         self.pending_free_slots.push_back((current_frame, index));
     }
 
+    /// This frame's graph handle, or `None` before [`Self::import_into`] ran for
+    /// the current graph build.
     pub fn handle(&self) -> Option<&Handle<RawBuffer>> {
-        self.handle.get()
+        self.handle.as_ref()
     }
 
-    pub fn set_handle(&mut self, rg: &mut crate::render_graph::RenderGraph) -> Result<(), Handle<RawBuffer>> {
-        self.handle.set(rg.import(self.gpu_only.clone()))
+    /// Import the GPU-side buffer into `rg` and cache the resulting handle.
+    /// A handle is only valid for one graph build (`RenderGraph::reset` clears
+    /// the virtual resources and restarts the id counter), so this must be
+    /// called on *every* rebuild, after `reset`.
+    pub fn import_into(&mut self, rg: &mut crate::render_graph::RenderGraph) -> Handle<RawBuffer> {
+        let handle = rg.import(self.gpu_only.clone());
+        self.handle = Some(handle.clone());
+        handle
     }
 
     pub fn inner_gpu(&self) -> vk::Buffer {

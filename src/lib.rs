@@ -276,7 +276,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         let image_extent = utils::tuple_to_extent3d(image_extent);
 
         //must be filled by loading a scene
-        let mut resource_manager = vulkan_abstraction::ResourceManager::new_empty(Rc::clone(&core))?;
+        let resource_manager = vulkan_abstraction::ResourceManager::new_empty(Rc::clone(&core))?;
 
         let ray_gen_ris_spirv: &'static [u8] = include_bytes_align_as!(u32, concat!(env!("OUT_DIR"), "/ray_gen_ris.spirv"));
         let ray_gen_final_spirv: &'static [u8] = include_bytes_align_as!(u32, concat!(env!("OUT_DIR"), "/ray_gen_final.spirv"));
@@ -399,8 +399,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
             None => None,
         };
 
-        resource_manager.import_to_graph(&mut render_graph);
-
+       
 
         let renderer = Self {
             postprocess_result_image,
@@ -1420,14 +1419,12 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         self.relative_frame_count += 1;
         *self.core.absolute_frame_count.borrow_mut() += 1;
 
-        // Arena staging→GPU copies queued by asset loads: hand them to the graph so
-        // it records them as a transfer prologue at the head of this submission
-        // (ordered before the shader reads). Drained before the `rg` borrow so it
-        // stays disjoint from `self.resource_manager`.
-        let arena_copies = self.resource_manager.take_queued_copies();
-
         let rg = &mut self.render_graph;
         rg.reset();
+
+        // Re-import the arena buffers into this fresh build
+        let arena_handles = self.resource_manager.import_to_graph(rg);
+        let arena_copies = self.resource_manager.take_queued_copies()?;
         rg.add_prologue_buffer_copies(arena_copies);
 
         // Record this frame's acceleration-structure builds into the graph before
@@ -1538,6 +1535,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
             diffuse_h.clone(),
             motion_h.clone(),
             reservoir_handles.clone(),
+            arena_handles.clone(),
             tlas_h.clone(),
             extent,
         )?;
@@ -1551,6 +1549,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
             diffuse_h.clone(),
             motion_h.clone(),
             reservoir_handles,
+            arena_handles,
             tlas_h,
             extent,
         )?;
@@ -1654,6 +1653,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         diffuse_h: Handle<vulkan_abstraction::Image>,
         motion_h: Handle<vulkan_abstraction::Image>,
         reservoir_handles: [Handle<vulkan_abstraction::RawBuffer>; 4],
+        arena_handles: [Handle<vulkan_abstraction::RawBuffer>; 2],
         tlas_h: Handle<vulkan_abstraction::AccelerationStructure>,
         extent: vk::Extent3D,
     ) -> SrResult<()> {
@@ -1674,6 +1674,13 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         // reservoir reads after this pass (the RIS→final hand-off barrier).
         for h in &reservoir_handles {
             common.write(h, vk_sync::AccessType::AnyShaderWrite)?;
+        }
+        // Read the mesh-info / emissive-triangle arenas: this read against the
+        // prologue copy pass's write is what orders (and barriers) an asset load's
+        // staging→GPU copy before the trace that consumes it. Reached by device
+        // address / heap slot in the shader; this only governs synchronization.
+        for h in &arena_handles {
+            common.read(h, vk_sync::AccessType::RayTracingShaderReadOther)?;
         }
 
         let pass = RaytracingRenderPassBuilder::default()
@@ -1706,6 +1713,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         diffuse_h: Handle<vulkan_abstraction::Image>,
         motion_h: Handle<vulkan_abstraction::Image>,
         reservoir_handles: [Handle<vulkan_abstraction::RawBuffer>; 4],
+        arena_handles: [Handle<vulkan_abstraction::RawBuffer>; 2],
         tlas_h: Handle<vulkan_abstraction::AccelerationStructure>,
         extent: vk::Extent3D,
     ) -> SrResult<()> {
@@ -1723,6 +1731,10 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         // Read the reservoirs the RIS pass wrote — this read against the RIS pass's
         // declared writes is the graph edge that becomes the hand-off barrier.
         for h in &reservoir_handles {
+            common.read(h, vk_sync::AccessType::RayTracingShaderReadOther)?;
+        }
+        // Same arena reads as the RIS pass — see there.
+        for h in &arena_handles {
             common.read(h, vk_sync::AccessType::RayTracingShaderReadOther)?;
         }
 

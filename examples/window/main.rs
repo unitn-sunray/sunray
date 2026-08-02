@@ -95,7 +95,7 @@ impl App {
 
         // The scene's instance list belongs to the caller: keep it here and
         // pass it to `render_to_swapchain` every frame.
-        let (_scene_group, scene_instances) = renderer.load_gltf("examples/assets/bistro.glb")?;
+        let (_scene_group, scene_instances) = renderer.load_gltf("examples/assets/ReflectionRoom.glb")?;
         self.scene_instances = scene_instances;
         log::info!("Loaded {} unique BLASes from scene", self.scene_instances.len());
 
