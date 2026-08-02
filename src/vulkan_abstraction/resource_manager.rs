@@ -7,9 +7,10 @@ use ash::vk;
 use crate::render_graph::graph::RenderGraph;
 use crate::render_graph::resource::Handle;
 use crate::vulkan_abstraction::image::sampler::SamplerDesc;
-use crate::vulkan_abstraction::{AccelerationStructure, ArenaBuffer, AsBuildJob, Buffer, EntityGpuData, Material};
+use crate::vulkan_abstraction::{AccelerationStructure, ArenaBuffer, AsBuildJob, Buffer, EntityGpuData, Material, RawBuffer};
 use crate::{error::SrResult, vulkan_abstraction};
 use vk_sync_fork as vk_sync;
+use crate::error::{ErrorSource, SrError};
 
 const ARENA_CAPACITY: vk::DeviceSize = 4096 * 16;
 
@@ -61,7 +62,7 @@ pub(crate) struct ResourceManager<K: Hash + Eq + Copy> {
     /// loads. Drained each frame by [`Self::take_queued_copies`] and recorded as a
     /// transfer prologue in the render graph (`RenderGraph::add_prologue_buffer_copies`),
     /// so the copy rides the frame's submission ordered before the shader reads.
-    buffer_copies_queued: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>,
+    buffer_copies_queued: Vec<(vk::Buffer, Handle<RawBuffer>, vk::BufferCopy)>,
     /// Deferred work keyed by the absolute frame at whose start it must run
     /// (currently just deferred arena slot frees scheduled by `remove`). Drained
     /// by [`Self::start_of_frame`] — nothing runs unconditionally every frame.
@@ -185,24 +186,52 @@ impl<K: Hash + Eq + Copy + 'static> ResourceManager<K> {
         Ok(())
     }
 
+    pub fn import_to_graph(&mut self, rg : &mut RenderGraph ){
+        self.meshes_info.set_handle(rg).expect("This is meant to be called only once");
+        self.blas_emissive_triangles.set_handle(rg).expect("This is meant to be called only once");
+        
+        dbg!(self.meshes_info.handle());
+        dbg!(self.blas_emissive_triangles.handle());
+
+    }
+
     /// Drain the queued arena staging→GPU copies, collapsing redundant writes to
     /// the same destination region (keeping the latest) so the graph never records
     /// two unordered copies to one slot. The renderer records the result as a
     /// transfer prologue at the head of the frame's graph submission (ordered
     /// before the shader reads by [`RenderGraph::add_prologue_buffer_copies`]),
     /// replacing the old synchronous flush + device-wide idle wait.
-    pub fn take_queued_copies(&mut self) -> Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)> {
+    pub fn take_queued_copies(&mut self) -> Vec<(vk::Buffer, Handle<RawBuffer>, vk::BufferCopy)> {
         let copies = std::mem::take(&mut self.buffer_copies_queued);
         if copies.is_empty() {
             return copies;
         }
-        let mut seen: HashMap<(vk::Buffer, vk::DeviceSize, vk::DeviceSize), usize> = HashMap::new();
+
+        // Key: (Handle ID, dst_offset, size) -> Value: index in `copies`
+        // Using `dst.id` works perfectly since handles for the same resource share the same ID.
+        let mut latest_indices = std::collections::HashMap::new();
+
         for (i, (_, dst, region)) in copies.iter().enumerate() {
-            seen.insert((*dst, region.dst_offset, region.size), i);
+            latest_indices.insert((dst.id, region.dst_offset, region.size), i);
         }
-        let mut kept: Vec<usize> = seen.into_values().collect();
-        kept.sort_unstable();
-        kept.into_iter().map(|i| copies[i]).collect()
+
+        // Sort the retained indices to preserve their relative submission order
+        let mut kept_indices: Vec<usize> = latest_indices.into_values().collect();
+        kept_indices.sort_unstable();
+
+        // Consume the original vector and only push the copies whose indices we kept.
+        // This avoids needing `Clone` on `Handle` or `vk::BufferCopy`.
+        let mut result = Vec::with_capacity(kept_indices.len());
+        let mut kept_iter = kept_indices.into_iter().peekable();
+
+        for (i, copy) in copies.into_iter().enumerate() {
+            if Some(&i) == kept_iter.peek() {
+                result.push(copy);
+                kept_iter.next();
+            }
+        }
+
+        result
     }
 
     // ─── Per-frame data ──────────────────────────────────────────────────────
@@ -427,7 +456,7 @@ impl<K: Hash + Eq + Copy + 'static> ResourceManager<K> {
             material,
         };
         let (slot, copy_region) = self.meshes_info.allocate_and_update(&gpu_data)?;
-        self.queue_copy(self.meshes_info.inner_staging(), self.meshes_info.inner(), copy_region);
+        self.queue_copy(self.meshes_info.inner_staging(), self.meshes_info.handle().expect("The handle should be set at the start").clone(), copy_region);
         self.mesh_info_slots.insert(key, slot as u32);
 
         let mut tri_slots = Vec::with_capacity(emissive_triangles.len());
@@ -435,7 +464,7 @@ impl<K: Hash + Eq + Copy + 'static> ResourceManager<K> {
             let (tri_slot, tri_copy) = self.blas_emissive_triangles.allocate_and_update(tri)?;
             self.queue_copy(
                 self.blas_emissive_triangles.inner_staging(),
-                self.blas_emissive_triangles.inner(),
+                self.blas_emissive_triangles.handle().expect("The handle should be set at the start").clone(),
                 tri_copy,
             );
             tri_slots.push(tri_slot as u32);
@@ -516,7 +545,7 @@ impl<K: Hash + Eq + Copy + 'static> ResourceManager<K> {
 
     // ─── Internal helpers ────────────────────────────────────────────────────
 
-    fn queue_copy(&mut self, src: vk::Buffer, dst: vk::Buffer, region: vk::BufferCopy) {
+    fn queue_copy(&mut self, src: vk::Buffer, dst: Handle<RawBuffer>, region: vk::BufferCopy) {
         // Just enqueue: the renderer drains these via `take_queued_copies` each
         // frame and records them as a transfer prologue in the render graph.
         self.buffer_copies_queued.push((src, dst, region));

@@ -1,10 +1,11 @@
 use crate::render_graph::graph::PassResourceAccessType;
 use crate::vulkan_abstraction::acceleration_structure::{ASDesc, TlasBuildDesc};
 use crate::vulkan_abstraction::buffer::BufferDesc;
-use crate::vulkan_abstraction::image::ImageDesc;
 use crate::vulkan_abstraction::image::sampler::SamplerDesc;
+use crate::vulkan_abstraction::image::ImageDesc;
 use crate::vulkan_abstraction::{AccelerationStructure, Buffer, Image, RawBuffer, Sampler};
 use enum_as_inner::EnumAsInner;
+use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use vk_sync_fork as vk_sync;
@@ -24,6 +25,11 @@ pub struct Handle<ResourceType: Resource> {
     pub(crate) desc: <ResourceType as Resource>::Desc,
     pub(crate) marker: PhantomData<ResourceType>,
 }
+
+
+
+
+
 
 // Manual `Clone` so a `Handle` is cloneable regardless of whether the resource
 // type itself is `Clone` (it never needs to be — only the `Desc` is stored).
@@ -61,7 +67,7 @@ pub enum GraphResourceImportInfo {
         access_type: vk_sync::AccessType,
     },
     Buffer {
-        resource: Arc<RawBuffer>,
+        resource: Arc<dyn Buffer>,
         access_type: vk_sync::AccessType,
     },
     Sampler {

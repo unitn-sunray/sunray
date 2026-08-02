@@ -276,7 +276,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         let image_extent = utils::tuple_to_extent3d(image_extent);
 
         //must be filled by loading a scene
-        let resource_manager = vulkan_abstraction::ResourceManager::new_empty(Rc::clone(&core))?;
+        let mut resource_manager = vulkan_abstraction::ResourceManager::new_empty(Rc::clone(&core))?;
 
         let ray_gen_ris_spirv: &'static [u8] = include_bytes_align_as!(u32, concat!(env!("OUT_DIR"), "/ray_gen_ris.spirv"));
         let ray_gen_final_spirv: &'static [u8] = include_bytes_align_as!(u32, concat!(env!("OUT_DIR"), "/ray_gen_final.spirv"));
@@ -398,6 +398,9 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
             }
             None => None,
         };
+
+        resource_manager.import_to_graph(&mut render_graph);
+
 
         let renderer = Self {
             postprocess_result_image,

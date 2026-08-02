@@ -1,17 +1,11 @@
-pub mod arena_core;
 pub mod arena_gpu;
-pub mod arena_host;
-pub mod arena_keyed;
 pub mod gpu_only_buffer;
 pub mod index_buffer;
 pub mod staging_buffer;
 pub mod uniform_buffer;
 pub mod vertex_buffer;
 
-pub use arena_core::*;
 pub use arena_gpu::*;
-pub use arena_host::*;
-pub use arena_keyed::*;
 pub use gpu_only_buffer::*;
 pub use index_buffer::*;
 pub use staging_buffer::*;
@@ -22,11 +16,12 @@ use crate::render_graph::resource::ResourceDesc;
 use crate::vulkan_abstraction::descriptor_heap::{DescriptorSlot, ResourceDescriptorKind};
 use crate::{error::*, vulkan_abstraction};
 use ash::vk;
-use ash::vk::{BufferUsageFlags, Handle};
+use ash::vk::{BufferUsageFlags, DeviceAddress, DeviceSize, Handle};
 use std::cell::Cell;
 use std::fmt::{Debug, Formatter};
 use std::rc::Rc;
 use std::sync::Arc;
+use crate::vulkan_abstraction::Core;
 
 //TODO revert capacity as vk::device length some methods signatures
 //TODO should gpu only buffer have a generic and some methods can be moved inside the buffer trait like new,new with data ecc.. with a default impl
@@ -102,6 +97,51 @@ pub struct RawBuffer {
     /// `Drop` still destroys the `vk::Buffer` but skips `Allocator::free`.
     owns_memory: bool,
 }
+impl Buffer for RawBuffer {
+    fn inner(&self) -> vk::Buffer {
+        self.buffer
+    }
+
+    fn usage(&self) -> BufferUsageFlags {
+        self.usage
+    }
+
+    fn raw(&self) -> &RawBuffer {
+        self
+    }
+
+    fn raw_mut(&mut self) -> &mut RawBuffer {
+        self
+    }
+
+    fn byte_size(&self) -> DeviceSize {
+       self.byte_size
+    }
+
+    fn is_null(&self) -> bool {
+       self.buffer.is_null()
+    }
+
+    fn get_device_address(&self) -> DeviceAddress {
+        self.device_address()
+    }
+
+    fn new_null(core: Rc<vulkan_abstraction::Core>) -> Self {
+        Self {
+            core,
+            buffer: vk::Buffer::null(),
+            allocation: gpu_allocator::vulkan::Allocation::default(),
+            byte_size: 0,
+            usage: BufferUsageFlags::empty(),
+            uniform_slot: Cell::new(None),
+            storage_slot: Cell::new(None),
+            // Null buffer: the existing `Drop` early-returns on null anyway, but mark
+            // ownership consistent with `new_aligned`.
+            owns_memory: true,
+        }
+    }
+}
+
 
 // `RawBuffer` can't `#[derive(Debug)]`: its `core: Rc<Core>` field doesn't
 // implement `Debug` (and `Allocation` / the `Cell` slots aren't worth printing).
@@ -184,20 +224,7 @@ impl RawBuffer {
         })
     }
 
-    pub fn new_null(core: Rc<vulkan_abstraction::Core>) -> Self {
-        Self {
-            core,
-            buffer: vk::Buffer::null(),
-            allocation: gpu_allocator::vulkan::Allocation::default(),
-            byte_size: 0,
-            usage: BufferUsageFlags::empty(),
-            uniform_slot: Cell::new(None),
-            storage_slot: Cell::new(None),
-            // Null buffer: the existing `Drop` early-returns on null anyway, but mark
-            // ownership consistent with `new_aligned`.
-            owns_memory: true,
-        }
-    }
+   
 
     /// Create a bare `vk::Buffer` handle and report its memory requirements without
     /// allocating or binding any memory. Counterpart to `Image::create_unbound`;
@@ -235,18 +262,7 @@ impl RawBuffer {
             owns_memory: false,
         })
     }
-
-    pub fn byte_size(&self) -> u64 {
-        self.byte_size
-    }
-
-    pub fn inner(&self) -> vk::Buffer {
-        self.buffer
-    }
-
-    pub fn usage(&self) -> vk::BufferUsageFlags {
-        self.usage
-    }
+    
 
     /// GPU device address of this buffer. Requires the buffer to have been
     /// created with `SHADER_DEVICE_ADDRESS` usage; returns 0 for a null buffer.
@@ -500,6 +516,7 @@ impl crate::render_graph::graph::RgImportable<BufferDesc> for Arc<RawBuffer> {
     }
 }
 
+
 impl From<Arc<RawBuffer>> for crate::render_graph::graph::GraphResourceImportInfo {
     fn from(val: Arc<RawBuffer>) -> Self {
         crate::render_graph::graph::GraphResourceImportInfo::Buffer {
@@ -509,6 +526,8 @@ impl From<Arc<RawBuffer>> for crate::render_graph::graph::GraphResourceImportInf
         }
     }
 }
+
+
 
 #[derive(Clone, Debug)]
 pub struct BufferDesc {

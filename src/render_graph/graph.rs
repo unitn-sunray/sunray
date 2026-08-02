@@ -1,17 +1,18 @@
-use crate::MAX_FRAMES_IN_FLIGHT;
-use crate::error::{SrError, SrResult};
+use crate::error::{ErrorSource, SrError, SrResult};
+use crate::render_graph::error::GraphError;
 use crate::render_graph::pass_builder::{
-    ComputeRenderPass, PassCommonDataBuilder, RasterRenderPass, RaytracingRenderPass, TransferPass, TransferPassBuilder,
+    ComputeRenderPass, PassCommonDataBuilder, RasterRenderPass, RaytracingRenderPass, TransferPass,
 };
 pub(crate) use crate::render_graph::resource::{
     GraphResourceDesc, GraphResourceImportInfo, GraphResourceInfo, Handle, Resource, ResourceDesc, RgImportable,
 };
 use crate::render_graph::transient_resources::TransientResources;
 use crate::vulkan_abstraction::{
-    AccelerationStructure, AsBuildJob, CmdBuffer, ComputePipeline, Core, GpuOnlyBuffer, GraphicsPipeline,
+    AccelerationStructure, AsBuildJob, Buffer, CmdBuffer, ComputePipeline, Core, GpuOnlyBuffer, GraphicsPipeline,
     GraphicsPipelineShaders, HeapComputePass, Image, Pipeline, RawBuffer, RayTracingPipeline, RayTracingPipelineShaders,
     ShaderBindingTable, TimelineSemaphore,
 };
+use crate::MAX_FRAMES_IN_FLIGHT;
 use ash::vk;
 use petgraph::visit::EdgeRef;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -19,6 +20,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
 use vk_sync_fork as vk_sync;
+use vk_sync_fork::AccessType;
 
 #[derive(Copy, Clone, Debug)]
 pub enum PassResourceAccessSyncType {
@@ -308,7 +310,7 @@ pub struct RenderGraph {
     /// Arena staging→GPU copies to record as a transfer prologue at the head of
     /// this frame's submission (handed over by the resource manager on asset
     /// load). Cleared on `reset`. See [`Self::add_prologue_buffer_copies`].
-    prologue_copies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>,
+    prologue_copies: Vec<(vk::Buffer, Handle<RawBuffer>, vk::BufferCopy)>,
     /// Signaled with the absolute frame count when each frame's graph submission
     /// completes. Drives CPU slot-reuse gating, the cross-frame temporal
     /// ping-pong wait (frame F's graph waits F-1's), and the blit's wait on the
@@ -398,8 +400,17 @@ impl RenderGraph {
     /// program-lifetime with CPU-side frame ring buffering and are only reached by
     /// device address in shaders, so they are *not* tracked as graph resources —
     /// this only guarantees the copy is ordered before the reads.
-    pub fn add_prologue_buffer_copies(&mut self, mut copies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>) {
-        self.prologue_copies.append(&mut copies);
+    pub fn add_prologue_buffer_copies(
+        &mut self,
+        mut copies: Vec<(
+            vk::Buffer,
+            Handle<RawBuffer>,
+            vk::BufferCopy,
+        )>,
+    ) {
+        self.prologue_copies.append(
+            &mut copies
+        );
     }
 
     /// Clear all per-frame state (passes, virtual resources, transient bindings,
@@ -560,7 +571,7 @@ impl RenderGraph {
     ) -> [vk::DeviceAddress; MAX_FRAMES_IN_FLIGHT] {
         let imports = &self.temporal_resources[exported.index].imports;
         std::array::from_fn(|i| match &imports[i] {
-            GraphResourceImportInfo::Buffer { resource, .. } => resource.device_address(),
+            GraphResourceImportInfo::Buffer { resource, .. } => resource.get_device_address(),
             _ => unreachable!("temporal buffer resource backed by a non-buffer import"),
         })
     }
@@ -693,10 +704,7 @@ impl RenderGraph {
             Ok(())
         });
 
-        let pass = TransferPassBuilder::default()
-            .common(common.build())
-            .build()
-            .map_err(|e| SrError::new_custom(format!("AS build pass builder failed: {e}")))?;
+        let pass = common.build_transfer();
         self.add_render_pass(pass);
         Ok(())
     }
@@ -806,6 +814,48 @@ impl RenderGraph {
         // for example you could build a tlas the next frame if this is seen as an internal or created on the spot data structure, but exporting it would block the cpu on interacting with it until the previous frame has ended.
         // To further emphasise this there will need to be a dedicated way to handle multiple data based of frames in flight , transformation matrices and the camera should only live as long as a frame.
 
+
+
+
+
+        if !self.prologue_copies.is_empty() {
+
+            let mut hashset = HashSet::new();
+            let mut prologue_copies_node_builder = PassCommonDataBuilder::new(self, "Internal prologue copy node");
+
+            for dst in self.prologue_copies.iter().map(|(_, dst, _)| dst) {
+                if hashset.insert(dst.id) {
+                    prologue_copies_node_builder.write(&dst, AccessType::TransferWrite)?;
+                }
+            }
+
+            let device_out = self.core.device().clone();
+            let prologue_copies_for_closure = self.prologue_copies.clone();
+            prologue_copies_node_builder.render(move |cmd_buffer, transient_resources| {
+                let device = device_out.inner();
+
+                unsafe {
+                    for (src, dst, region) in prologue_copies_for_closure.iter() {
+                        if let Some(dst_raw) = transient_resources.external_buffers.get(&dst.id) {
+                            device.cmd_copy_buffer(*cmd_buffer, *src, dst_raw.inner(), std::slice::from_ref(region));
+
+                        }else {
+                            return Err(SrError::new( ErrorSource::RenderGraph(GraphError::InvalidResourceRef), format!("External Buffer with id not found {:?}" , &dst.id)));
+                        }
+                    }
+                }
+                SrResult::Ok(())
+            });
+
+
+            self.passes.insert(
+                0,
+                AnyRenderPass::Transfer(prologue_copies_node_builder.build_transfer())
+            );
+        }
+
+        //From now on the graph passes should not be touched
+
         let slot = self.current_slot();
         let pass_count = self.passes.len();
 
@@ -817,6 +867,8 @@ impl RenderGraph {
         //Note: acyclic graph ir with phi
 
         let pass_nodes: Vec<petgraph::graph::NodeIndex> = (0..pass_count).map(|i| dep_graph.add_node(i)).collect();
+
+        //TODO let mut initialization_node = AnyRenderPass::Compute();
 
         for (pass_id, pass) in self.passes.iter().enumerate() {
             let common = match pass {
@@ -843,6 +895,7 @@ impl RenderGraph {
                         },
                     );
                 }
+
                 state.readers_since_write.push((pass_id, read.access.access_type));
             }
 
@@ -882,28 +935,7 @@ impl RenderGraph {
             }
         }
 
-        // Export the end state of every resource: the last pass that touches it
-        // and the access it is left in when the submission completes. Usages are
-        // recorded in pass-id order, so the last entry is the latest pass.
-        // TODO(temp impl): nothing consumes these yet — see `ResourceEndState`
-        // for the intended pass-to-pass cross-submission sync.
-        self.resource_end_states.clear();
-        for (res_id, info) in self.virtual_resources.iter().enumerate() {
-            let res_id = res_id as u32;
-            let internal = matches!(info, GraphResourceInfo::Created(_));
-            let (last_use_pass, end_access) = match resource_usages.get(&res_id).and_then(|u| u.usages.last()) {
-                Some((pass, access)) => (Some(*pass), access.access_type),
-                None => (None, vk_sync::AccessType::Nothing),
-            };
-            self.resource_end_states.insert(
-                res_id,
-                ResourceEndState {
-                    last_use_pass,
-                    end_access,
-                    internal,
-                },
-            );
-        }
+        self.set_resources_end_states(&mut resource_usages);
 
         // Cross-frame sync for temporal (ping-pong / history) resources: thread
         // each backing's end access this frame back into its stored import, so
@@ -980,38 +1012,6 @@ impl RenderGraph {
         unsafe {
             device.reset_command_buffer(raw_cb, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(raw_cb, &vk::CommandBufferBeginInfo::default())?;
-        }
-
-        // Transfer prologue: arena staging→GPU copies (queued by the resource
-        // manager on asset load) recorded at the head of this submission, then one
-        // buffer barrier so the RT/compute passes that read the arenas (by device
-        // address) see the writes. Recorded outside the hazard graph on purpose —
-        // the arenas are program-lifetime, CPU ring-buffered, and never graph
-        // resources (see `add_prologue_buffer_copies`).
-        if !self.prologue_copies.is_empty() {
-            let unique_dsts: HashSet<vk::Buffer> = self.prologue_copies.iter().map(|(_, dst, _)| *dst).collect();
-            let barriers: Vec<vk::BufferMemoryBarrier2> = unique_dsts
-                .into_iter()
-                .map(|buf| {
-                    vk::BufferMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR | vk::PipelineStageFlags2::COMPUTE_SHADER)
-                        .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .buffer(buf)
-                        .offset(0)
-                        .size(vk::WHOLE_SIZE)
-                })
-                .collect();
-            unsafe {
-                for (src, dst, region) in &self.prologue_copies {
-                    device.cmd_copy_buffer(raw_cb, *src, *dst, std::slice::from_ref(region));
-                }
-                let dep = vk::DependencyInfo::default().buffer_memory_barriers(&barriers);
-                device.cmd_pipeline_barrier2(raw_cb, &dep);
-            }
         }
 
         // Initial layout transitions for created (transient) images. Their memory
@@ -1142,6 +1142,30 @@ impl RenderGraph {
         }
 
         Ok(())
+    }
+    /// Export the end state of every resource: the last pass that touches it
+    /// and the access it is left in when the submission completes. Usages are
+    /// recorded in pass-id order, so the last entry is the latest pass.
+    /// TODO(temp impl): nothing consumes these yet — see `ResourceEndState`
+    /// for the intended pass-to-pass cross-submission sync.
+    fn set_resources_end_states(&mut self, resource_usages: &mut BTreeMap<u32, ResourceLifetimeUsage>) {
+        self.resource_end_states.clear();
+        for (res_id, info) in self.virtual_resources.iter().enumerate() {
+            let res_id = res_id as u32;
+            let internal = matches!(info, GraphResourceInfo::Created(_));
+            let (last_use_pass, end_access) = match resource_usages.get(&res_id).and_then(|u| u.usages.last()) {
+                Some((pass, access)) => (Some(*pass), access.access_type),
+                None => (None, vk_sync::AccessType::Nothing),
+            };
+            self.resource_end_states.insert(
+                res_id,
+                ResourceEndState {
+                    last_use_pass,
+                    end_access,
+                    internal,
+                },
+            );
+        }
     }
 
     /// Return a `'static` checkpoint marker for `name`, leaking a fresh

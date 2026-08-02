@@ -66,6 +66,9 @@ pub(crate) struct PassCommonData {
 pub struct PassCommonDataBuilder {
     pass_common_data: PassCommonData,
 }
+
+
+
 impl PassCommonDataBuilder {
     pub fn new(rg: &mut RenderGraph, name: impl Into<String>) -> Self {
         Self {
@@ -93,6 +96,15 @@ impl PassCommonDataBuilder {
     pub fn build(self) -> PassCommonData {
         self.pass_common_data
     }
+
+    /// Finalize the builder as a transfer render pass and consume it into the `PassCommonData` that the
+    /// concrete pass builders embed.
+    pub fn build_transfer(self) -> TransferPass {
+         TransferPass{
+             common: self.pass_common_data
+         } 
+    }
+    
     pub fn read<Res: Resource>(&mut self, resource: &Handle<Res>, access_type: vk_sync_fork::AccessType) -> SrResult<()> {
         if !access_type.is_write_access() {
             self.pass_common_data.read.push(ResourceRef {
@@ -110,6 +122,10 @@ impl PassCommonDataBuilder {
             ))
         }
     }
+
+
+   
+  
 
     pub fn write<Res: Resource>(&mut self, resource: &Handle<Res>, access_type: vk_sync_fork::AccessType) -> SrResult<()> {
         //TODO this needs to change the resource version
@@ -473,8 +489,7 @@ pub(crate) struct ComputeRenderPass {
     pub(super) shaders: Option<ComputeShaders>,
 }
 
-#[derive(Builder)]
-#[builder(pattern = "owned")]
+
 /// This is an explicit way to map operations to delegate to the dma controller
 pub(crate) struct TransferPass {
     pub(super) common: PassCommonData,

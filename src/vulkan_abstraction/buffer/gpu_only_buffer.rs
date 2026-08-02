@@ -1,9 +1,10 @@
 use crate::error::SrResult;
 use crate::vulkan_abstraction;
-use crate::vulkan_abstraction::Buffer;
+use crate::vulkan_abstraction::{Buffer, BufferDesc};
 use crate::vulkan_abstraction::{RawBuffer, StagingBuffer};
 use ash::vk;
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub struct GpuOnlyBuffer {
     raw: RawBuffer,
@@ -77,5 +78,27 @@ impl GpuOnlyBuffer {
 impl From<GpuOnlyBuffer> for RawBuffer {
     fn from(value: GpuOnlyBuffer) -> Self {
         value.raw
+    }
+}
+
+
+impl crate::render_graph::graph::RgImportable<BufferDesc> for Arc<GpuOnlyBuffer> {
+    fn import(&self) -> BufferDesc {
+        BufferDesc {
+            byte_size: self.byte_size(),
+            alignment: 1,
+            memory_location: gpu_allocator::MemoryLocation::GpuOnly,
+            usage: self.usage(),
+            name: "imported",
+        }
+    }
+}
+impl From<Arc<GpuOnlyBuffer>> for crate::render_graph::graph::GraphResourceImportInfo {
+    fn from(val: Arc<GpuOnlyBuffer>) -> Self {
+        crate::render_graph::graph::GraphResourceImportInfo::Buffer {
+            resource: val,
+            //TODO let the caller supply the initial access state instead of defaulting to Nothing
+            access_type: vk_sync_fork::AccessType::Nothing,
+        }
     }
 }

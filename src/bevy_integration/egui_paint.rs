@@ -19,7 +19,7 @@ use ash::vk;
 
 use super::egui_support::ExtractedEgui;
 use crate::error::{SrError, SrResult};
-use crate::vulkan_abstraction::{self, CmdBuffer, Core, GraphicsPipeline, Image, RawBuffer, Sampler};
+use crate::vulkan_abstraction::{self, Buffer, CmdBuffer, Core, GraphicsPipeline, Image, RawBuffer, Sampler};
 
 /// GPU vertex layout (matches `egui.slang`'s `VSIn`): 20 bytes.
 #[repr(C)]

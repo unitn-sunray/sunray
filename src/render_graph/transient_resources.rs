@@ -5,10 +5,7 @@ use crate::render_graph::graph::{
 use crate::render_graph::resource::{GraphResourceDesc, GraphResourceImportInfo, GraphResourceInfo, Handle};
 use crate::vulkan_abstraction::buffer::BufferDesc;
 use crate::vulkan_abstraction::image::ImageDesc;
-use crate::vulkan_abstraction::{
-    AccelerationStructure, ComputePipeline, Core, GraphicsPipeline, HeapComputePass, Image, RawBuffer, RayTracingPipeline,
-    Sampler, ShaderBindingTable,
-};
+use crate::vulkan_abstraction::{AccelerationStructure, Buffer, ComputePipeline, Core, GraphicsPipeline, HeapComputePass, Image, RawBuffer, RayTracingPipeline, Sampler, ShaderBindingTable};
 use ash::vk;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -18,7 +15,7 @@ use vk_sync_fork as vk_sync;
 #[derive(Default)]
 pub struct TransientResources {
     pub(super) external_images: HashMap<u32, Arc<Image>>,
-    pub(super) external_buffers: HashMap<u32, Arc<RawBuffer>>,
+    pub(super) external_buffers: HashMap<u32, Arc<dyn Buffer>>,
     pub(super) external_samplers: HashMap<u32, Arc<Sampler>>,
     pub(super) external_raytracing_ac: HashMap<u32, Arc<AccelerationStructure>>,
     /// One wrapper per *resource id*, even when several resources share a memory
