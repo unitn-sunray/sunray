@@ -4,13 +4,13 @@ use std::rc::Rc;
 
 use ash::vk;
 
+use crate::error::{ErrorSource, SrError};
 use crate::render_graph::graph::RenderGraph;
 use crate::render_graph::resource::Handle;
 use crate::vulkan_abstraction::image::sampler::SamplerDesc;
 use crate::vulkan_abstraction::{AccelerationStructure, ArenaBuffer, AsBuildJob, Buffer, EntityGpuData, Material, RawBuffer};
 use crate::{error::SrResult, vulkan_abstraction};
 use vk_sync_fork as vk_sync;
-use crate::error::{ErrorSource, SrError};
 
 const ARENA_CAPACITY: vk::DeviceSize = 4096 * 16;
 
@@ -202,10 +202,7 @@ impl<K: Hash + Eq + Copy + 'static> ResourceManager<K> {
     /// The returned handles are what consumers (the RT passes) declare reads on, so
     /// the prologue copy is ordered before — and barriered against — the trace.
     pub fn import_to_graph(&mut self, rg: &mut RenderGraph) -> [Handle<RawBuffer>; 2] {
-        [
-            self.meshes_info.import_into(rg),
-            self.blas_emissive_triangles.import_into(rg),
-        ]
+        [self.meshes_info.import_into(rg), self.blas_emissive_triangles.import_into(rg)]
     }
 
     /// Drain the queued arena staging→GPU copies, collapsing redundant writes to
@@ -214,7 +211,7 @@ impl<K: Hash + Eq + Copy + 'static> ResourceManager<K> {
     /// transfer prologue at the head of the frame's graph submission (ordered
     /// before the shader reads by [`RenderGraph::add_prologue_buffer_copies`]),
     /// replacing the old synchronous flush + device-wide idle wait.
-    pub fn take_queued_copies(&mut self) -> SrResult<Vec<(vk::Buffer, Handle<RawBuffer>, vk::BufferCopy)>> {
+    pub fn take_queued_copies(&mut self) -> SrResult<Vec<(&RawBuffer, Handle<RawBuffer>, vk::BufferCopy)>> {
         let copies = std::mem::take(&mut self.buffer_copies_queued);
         if copies.is_empty() {
             return Ok(vec![]);
@@ -233,12 +230,9 @@ impl<K: Hash + Eq + Copy + 'static> ResourceManager<K> {
         let mut result = Vec::with_capacity(kept_indices.len());
         for i in kept_indices {
             let (arena, region) = copies[i];
-            let (src, handle) = match arena {
-                ArenaId::MeshInfo => (self.meshes_info.inner_staging(), self.meshes_info.handle()),
-                ArenaId::EmissiveTriangles => (
-                    self.blas_emissive_triangles.inner_staging(),
-                    self.blas_emissive_triangles.handle(),
-                ),
+            let (src, handle): (&RawBuffer, _) = match arena {
+                ArenaId::MeshInfo => (self.meshes_info.staging().raw(), self.meshes_info.handle()),
+                ArenaId::EmissiveTriangles => (self.blas_emissive_triangles.staging().raw(), self.blas_emissive_triangles.handle()),
             };
             let handle = handle.ok_or_else(|| {
                 SrError::new(

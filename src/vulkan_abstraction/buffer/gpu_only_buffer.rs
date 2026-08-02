@@ -81,7 +81,6 @@ impl From<GpuOnlyBuffer> for RawBuffer {
     }
 }
 
-
 impl crate::render_graph::graph::RgImportable<BufferDesc> for Arc<GpuOnlyBuffer> {
     fn import(&self) -> BufferDesc {
         BufferDesc {

@@ -399,8 +399,6 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
             None => None,
         };
 
-       
-
         let renderer = Self {
             postprocess_result_image,
 
@@ -1425,7 +1423,11 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         // Re-import the arena buffers into this fresh build
         let arena_handles = self.resource_manager.import_to_graph(rg);
         let arena_copies = self.resource_manager.take_queued_copies()?;
-        rg.add_prologue_buffer_copies(arena_copies);
+        // SAFETY: the sources are the resource manager's staging arena buffers.
+        // The arena owns them for the renderer's lifetime, they are not graph
+        // resources, and `take_queued_copies` hands out only copies staged for
+        // this frame.
+        unsafe { rg.add_prologue_buffer_copies(arena_copies)? };
 
         // Record this frame's acceleration-structure builds into the graph before
         // any consumer: pending BLAS builds first (so the TLAS build orders itself

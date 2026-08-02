@@ -8,6 +8,9 @@ pub enum GraphError {
     InvalidResourceRef,
     SwapchainAlreadyImported,
     MissingCoreForCompile,
+    /// A transfer pass' `vk::BufferCopy` region does not fit inside the buffer it
+    /// names — see `TransferPassBuilder`.
+    CopyRegionOutOfBounds,
 }
 
 impl Display for GraphError {

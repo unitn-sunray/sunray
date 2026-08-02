@@ -5,7 +5,10 @@ use crate::render_graph::graph::{
 use crate::render_graph::resource::{GraphResourceDesc, GraphResourceImportInfo, GraphResourceInfo, Handle};
 use crate::vulkan_abstraction::buffer::BufferDesc;
 use crate::vulkan_abstraction::image::ImageDesc;
-use crate::vulkan_abstraction::{AccelerationStructure, Buffer, ComputePipeline, Core, GraphicsPipeline, HeapComputePass, Image, RawBuffer, RayTracingPipeline, Sampler, ShaderBindingTable};
+use crate::vulkan_abstraction::{
+    AccelerationStructure, Buffer, ComputePipeline, Core, GraphicsPipeline, HeapComputePass, Image, RawBuffer,
+    RayTracingPipeline, Sampler, ShaderBindingTable,
+};
 use ash::vk;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -392,6 +395,16 @@ impl TransientResources {
         Err(SrError::new_custom(format!(
             "render graph: no image bound for resource id {id} (not created or imported as an image)"
         )))
+    }
+
+    /// The raw `vk::Buffer` bound to resource id `id`, transient or imported.
+    /// Used by the graph to resolve a [`TransferPass`](crate::render_graph::pass_builder::TransferPass)'s
+    /// declarative copy list at record time.
+    pub(crate) fn buffer_by_id(&self, id: u32) -> Option<vk::Buffer> {
+        self.transient_buffers
+            .get(&id)
+            .map(|buf| buf.inner())
+            .or_else(|| self.external_buffers.get(&id).map(|buf| buf.inner()))
     }
 
     /// Resolve a [`PipelineHandle`] to its interned compute pipeline. Render

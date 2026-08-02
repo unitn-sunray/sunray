@@ -3,7 +3,7 @@ use crate::render_graph::error::GraphError;
 use crate::render_graph::graph::{AnyRenderPass, PassResourceAccessSyncType, PassResourceAccessType, RenderGraph};
 use crate::render_graph::resource::{Handle, Resource, ResourceRef};
 use crate::render_graph::transient_resources::TransientResources;
-use crate::vulkan_abstraction::{GraphicsPipelineShaders, Pipeline, RayTracingPipelineShaders};
+use crate::vulkan_abstraction::{Buffer, GraphicsPipelineShaders, Pipeline, RawBuffer, RayTracingPipelineShaders};
 use ash::vk;
 use ash::vk::CommandBuffer;
 use derive_builder::Builder;
@@ -67,7 +67,26 @@ pub struct PassCommonDataBuilder {
     pass_common_data: PassCommonData,
 }
 
-
+/// Append `(res_id, access_type)` to a pass's read or write list unless that
+/// exact pair is already there.
+///
+///
+/// TODO Real source of duplicates today: a transfer pass copying several regions into
+/// the same destination buffer declares `TransferWrite` on it once per region.
+fn push_unique(
+    list: &mut Vec<ResourceRef>,
+    res_id: u32,
+    access_type: vk_sync_fork::AccessType,
+    sync_type: PassResourceAccessSyncType,
+) {
+    if list.iter().any(|r| r.id == res_id && r.access.access_type == access_type) {
+        return;
+    }
+    list.push(ResourceRef {
+        id: res_id,
+        access: PassResourceAccessType { access_type, sync_type },
+    });
+}
 
 impl PassCommonDataBuilder {
     pub fn new(rg: &mut RenderGraph, name: impl Into<String>) -> Self {
@@ -97,23 +116,55 @@ impl PassCommonDataBuilder {
         self.pass_common_data
     }
 
-    /// Finalize the builder as a transfer render pass and consume it into the `PassCommonData` that the
-    /// concrete pass builders embed.
-    pub fn build_transfer(self) -> TransferPass {
-         TransferPass{
-             common: self.pass_common_data
-         } 
+    /// Finalize the builder as an [`InternalPass`] — a declaration-only node the
+    /// graph synthesizes for itself (see [`AnyRenderPass::Internal`]).
+    pub(super) fn build_internal(self) -> InternalPass {
+        InternalPass {
+            common: self.pass_common_data,
+        }
     }
-    
+
+    /// Declare an access on resource id `res_id` without the read/write
+    /// validation [`Self::read`] and [`Self::write`] apply, routing it to the
+    /// read or write list by [`vk_sync_fork::AccessType::is_write_access`].
+    ///
+    /// This is the internal-node path: `__imports` declares whatever access each
+    /// imported resource carries into the frame, which the caller-facing builders
+    /// have no way to express. It takes a bare id rather than a `Handle` because
+    /// the graph reaches these resources by id and has no `Desc` to fabricate.
+    ///
+    /// `AccessType::Nothing` is deliberately routed to the **write** list — it
+    /// means "contents are undefined and a transition is required", and in the
+    /// read list it would leave `last_writer` unset so the first real user of the
+    /// resource would get no barrier at all.
+    pub(super) fn declare_previous_imports(&mut self, res_id: u32, access_type: vk_sync_fork::AccessType) {
+        let sync_type = PassResourceAccessSyncType::AlwaysSync;
+        if access_type.is_write_access() || access_type == vk_sync_fork::AccessType::Nothing {
+            push_unique(&mut self.pass_common_data.write, res_id, access_type, sync_type);
+        } else {
+            push_unique(&mut self.pass_common_data.read, res_id, access_type, sync_type);
+        }
+    }
+
+    /// Declare an access on a resource routing it to the
+    /// read or write list by [`vk_sync_fork::AccessType::is_write_access`].
+    pub fn declare<Res: Resource>(&mut self, resource: &Handle<Res>, access_type: vk_sync_fork::AccessType) {
+        let sync_type = PassResourceAccessSyncType::AlwaysSync;
+        if access_type.is_write_access() {
+            push_unique(&mut self.pass_common_data.write, resource.id, access_type, sync_type);
+        } else {
+            push_unique(&mut self.pass_common_data.read, resource.id, access_type, sync_type);
+        }
+    }
+
     pub fn read<Res: Resource>(&mut self, resource: &Handle<Res>, access_type: vk_sync_fork::AccessType) -> SrResult<()> {
         if !access_type.is_write_access() {
-            self.pass_common_data.read.push(ResourceRef {
-                id: resource.id,
-                access: PassResourceAccessType {
-                    access_type,
-                    sync_type: PassResourceAccessSyncType::NeverSync,
-                },
-            });
+            push_unique(
+                &mut self.pass_common_data.read,
+                resource.id,
+                access_type,
+                PassResourceAccessSyncType::NeverSync,
+            );
             Ok(())
         } else {
             Err(SrError::new(
@@ -123,22 +174,17 @@ impl PassCommonDataBuilder {
         }
     }
 
-
-   
-  
-
     pub fn write<Res: Resource>(&mut self, resource: &Handle<Res>, access_type: vk_sync_fork::AccessType) -> SrResult<()> {
         //TODO this needs to change the resource version
         //TODO more complex not always sync write+write and read+write and render graph state id lookup
 
         if access_type.is_write_access() {
-            self.pass_common_data.write.push(ResourceRef {
-                id: resource.id,
-                access: PassResourceAccessType {
-                    access_type,
-                    sync_type: PassResourceAccessSyncType::AlwaysSync,
-                },
-            });
+            push_unique(
+                &mut self.pass_common_data.write,
+                resource.id,
+                access_type,
+                PassResourceAccessSyncType::AlwaysSync,
+            );
             Ok(())
         } else {
             Err(SrError::new(
@@ -187,6 +233,12 @@ impl From<ComputeRenderPass> for AnyRenderPass {
 impl From<TransferPass> for AnyRenderPass {
     fn from(val: TransferPass) -> Self {
         AnyRenderPass::Transfer(val)
+    }
+}
+
+impl From<InternalPass> for AnyRenderPass {
+    fn from(val: InternalPass) -> Self {
+        AnyRenderPass::Internal(val)
     }
 }
 
@@ -475,6 +527,24 @@ impl RasterRenderPassBuilder {
     }
 }
 
+/// Which queue a compute pass runs on.
+///
+/// Compute is the only pass kind whose queue is a real choice: raster and ray
+/// tracing always need the universal queue and buffer copies always belong on
+/// the DMA queue, so those are derived from the pass kind alone (see
+/// [`AnyRenderPass::queue_role`](super::graph::AnyRenderPass::queue_role)).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ComputeQueueAffinity {
+    /// Pin to the universal (graphics) queue.
+    Universal,
+    /// Pin to the async compute queue.
+    AsyncCompute,
+    /// TODO: let the scheduler pick, once the multi-queue heuristic exists.
+    /// Resolves to the universal queue until then.
+    #[default]
+    Inferred,
+}
+
 #[derive(Builder)]
 #[builder(pattern = "owned")]
 /// Remember the push-constant type used in `generate_render` must be `#[repr(C)]`
@@ -487,11 +557,202 @@ pub(crate) struct ComputeRenderPass {
     /// `ComputeRenderPassBuilder::generate_render`.
     #[builder(setter(strip_option), default)]
     pub(super) shaders: Option<ComputeShaders>,
+    /// Which queue this pass wants.
+    #[builder(default)]
+    pub(super) queue_affinity: ComputeQueueAffinity,
 }
 
+/// One endpoint of a buffer copy recorded by a [`TransferPass`].
+///
+/// `Handle` endpoints are graph resources: the pass declares a `TransferRead` /
+/// `TransferWrite` on them, so the graph infers their lifetimes and emits the
+/// surrounding barriers. `Raw` endpoints are untracked `vk::Buffer`s the graph
+/// knows nothing about — it declares nothing and orders nothing for them, which
+/// is why every builder method that takes one is `unsafe`.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum CopyEnd {
+    Handle(u32),
+    Raw(vk::Buffer),
+}
 
-/// This is an explicit way to map operations to delegate to the dma controller
+/// A pass whose entire content is a list of buffer copies, described
+/// declaratively rather than through a render closure.
+/// When possible this runs on a queue with direct access to the DMA.
+///
+/// `common.render` is always `None`; the graph records the copies itself.
 pub(crate) struct TransferPass {
+    pub(super) common: PassCommonData,
+    pub(super) copies: Vec<(CopyEnd, CopyEnd, vk::BufferCopy)>,
+}
+
+/// Check that `[offset, offset + region.size)` lies inside a buffer of
+/// `byte_size` bytes, and that the copy moves at least one byte.
+///
+/// Only callable for endpoints the graph can see: a `Handle<RawBuffer>` carries
+/// its `BufferDesc`, so the size is known at build time. Raw `vk::Buffer`
+/// endpoints have no size the graph can reach, which is why the methods taking
+/// one are `unsafe` — there the same bound becomes the caller's obligation.
+///
+/// Worth checking eagerly rather than leaving to validation layers: an
+/// out-of-bounds `vkCmdCopyBuffer` (VUID-vkCmdCopyBuffer-srcOffset-00113 /
+/// -dstOffset-00114) corrupts unrelated GPU memory or loses the device long
+/// after the fact, inside a command buffer that no longer says who built it.
+/// Failing here names the copy at the point it was declared.
+pub(super) fn check_copy_bounds(
+    which: &str,
+    buffer_name: &str,
+    byte_size: vk::DeviceSize,
+    offset: vk::DeviceSize,
+    region: &vk::BufferCopy,
+) -> SrResult<()> {
+    // VUID-VkBufferCopy-size-01988: a copy region must move at least one byte.
+    if region.size == 0 {
+        return Err(SrError::new(
+            GraphError::CopyRegionOutOfBounds.into(),
+            format!("transfer pass copy region has size 0 ({which} buffer \"{buffer_name}\")"),
+        ));
+    }
+    // `checked_add`: offset and size are both caller-supplied `u64`, so a naive
+    // `offset + size` can wrap and make an out-of-bounds copy look valid.
+    if region.size.checked_add(offset).is_none_or(|end| end > byte_size) {
+        return Err(SrError::new(
+            GraphError::CopyRegionOutOfBounds.into(),
+            format!(
+                "transfer pass copy runs past the end of its {which} buffer \"{buffer_name}\": \
+                 offset {offset} + size {} exceeds byte_size {byte_size}",
+                region.size
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Builder for [`TransferPass`]. Each `copy*` method declares the graph accesses
+/// it can, and bounds-checks every endpoint whose size it can reach — see
+/// [`CopyEnd`] for why three of the four are `unsafe`.
+pub struct TransferPassBuilder {
+    common: PassCommonDataBuilder,
+    copies: Vec<(CopyEnd, CopyEnd, vk::BufferCopy)>,
+}
+
+impl TransferPassBuilder {
+    pub fn new(rg: &mut RenderGraph, name: impl Into<String>) -> Self {
+        Self {
+            common: PassCommonDataBuilder::new(rg, name),
+            copies: Vec::new(),
+        }
+    }
+
+    /// Copy between two graph resources. Declares `TransferRead` on `src` and
+    /// `TransferWrite` on `dst`, so lifetimes and barriers are inferred, and
+    /// bounds-checks `region` against both buffers.
+    pub fn copy(&mut self, src: &Handle<RawBuffer>, dst: &Handle<RawBuffer>, region: vk::BufferCopy) -> SrResult<()> {
+        check_copy_bounds("source", src.desc.name, src.desc.byte_size, region.src_offset, &region)?;
+        check_copy_bounds("destination", dst.desc.name, dst.desc.byte_size, region.dst_offset, &region)?;
+        self.common.read(src, vk_sync_fork::AccessType::TransferRead)?;
+        self.common.write(dst, vk_sync_fork::AccessType::TransferWrite)?;
+        self.copies.push((CopyEnd::Handle(src.id), CopyEnd::Handle(dst.id), region));
+        Ok(())
+    }
+
+    /// Copy from an untracked buffer into a graph resource. Declares
+    /// `TransferWrite` on `dst`, and bounds-checks `region` against **both**
+    /// ends — `src` is untracked by the graph but still a live `Buffer`, so its
+    /// size is readable here.
+    ///
+    /// # Safety
+    /// `src` must outlive this graph submission — the borrow ends when this call
+    /// returns, but the GPU reads the buffer much later — must not alias any
+    /// graph-tracked resource, and is the caller's to synchronize against
+    /// non-graph work: the graph emits no barriers for it.
+    pub unsafe fn copy_from_raw(&mut self, src: &impl Buffer, dst: &Handle<RawBuffer>, region: vk::BufferCopy) -> SrResult<()> {
+        check_copy_bounds("source", "untracked", src.byte_size(), region.src_offset, &region)?;
+        check_copy_bounds("destination", dst.desc.name, dst.desc.byte_size, region.dst_offset, &region)?;
+        self.common.write(dst, vk_sync_fork::AccessType::TransferWrite)?;
+        self.copies.push((CopyEnd::Raw(src.inner()), CopyEnd::Handle(dst.id), region));
+        Ok(())
+    }
+
+    /// Copy from a graph resource into an untracked buffer. Declares
+    /// `TransferRead` on `src`, and bounds-checks `region` against both ends.
+    ///
+    /// # Safety
+    /// `dst` must outlive this graph submission — the borrow ends when this call
+    /// returns, but the GPU writes the buffer much later — must not alias any
+    /// graph-tracked resource, and is the caller's to synchronize against
+    /// non-graph work: the graph emits no barriers for it.
+    pub unsafe fn copy_to_raw(&mut self, src: &Handle<RawBuffer>, dst: &impl Buffer, region: vk::BufferCopy) -> SrResult<()> {
+        check_copy_bounds("source", src.desc.name, src.desc.byte_size, region.src_offset, &region)?;
+        check_copy_bounds("destination", "untracked", dst.byte_size(), region.dst_offset, &region)?;
+        self.common.read(src, vk_sync_fork::AccessType::TransferRead)?;
+        self.copies.push((CopyEnd::Handle(src.id), CopyEnd::Raw(dst.inner()), region));
+        Ok(())
+    }
+
+    /// Copy between two untracked buffers. Both ends are bounds-checked, but the
+    /// graph declares nothing and orders nothing — it only records the copy at
+    /// this point in the stream.
+    ///
+    /// # Safety
+    /// Both buffers must outlive this graph submission — the borrows end when
+    /// this call returns, but the GPU runs the copy much later — neither may
+    /// alias a graph-tracked resource, and both are the caller's to synchronize
+    /// against all other work, in-graph included: the graph emits no barriers
+    /// for either.
+    pub unsafe fn copy_raw(&mut self, src: &impl Buffer, dst: &impl Buffer, region: vk::BufferCopy) -> SrResult<()> {
+        check_copy_bounds("source", "untracked", src.byte_size(), region.src_offset, &region)?;
+        check_copy_bounds("destination", "untracked", dst.byte_size(), region.dst_offset, &region)?;
+        self.copies
+            .push((CopyEnd::Raw(src.inner()), CopyEnd::Raw(dst.inner()), region));
+        Ok(())
+    }
+
+    /// Prologue-copy path: `src` is a bare handle whose size the graph cannot
+    /// reach, because [`RenderGraph::add_prologue_buffer_copies`] already
+    /// bounds-checked it at queue time — the only point where the owning
+    /// `impl Buffer` is still in scope. `RenderGraph` has no lifetime parameter,
+    /// so the borrow cannot be parked in `prologue_copies` until compile.
+    ///
+    /// The `dst` side is still checked here.
+    ///
+    /// # Safety
+    /// As [`Self::copy_from_raw`], plus: `src` must be the buffer whose
+    /// `byte_size` was checked against `region` when the copy was queued.
+    pub(super) unsafe fn copy_from_prechecked_raw(
+        &mut self,
+        src: vk::Buffer,
+        dst: &Handle<RawBuffer>,
+        region: vk::BufferCopy,
+    ) -> SrResult<()> {
+        check_copy_bounds("destination", dst.desc.name, dst.desc.byte_size, region.dst_offset, &region)?;
+        self.common.write(dst, vk_sync_fork::AccessType::TransferWrite)?;
+        self.copies.push((CopyEnd::Raw(src), CopyEnd::Handle(dst.id), region));
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.copies.is_empty()
+    }
+
+    pub fn build(self) -> TransferPass {
+        TransferPass {
+            common: self.common.build(),
+            copies: self.copies,
+        }
+    }
+}
+
+/// A node the graph synthesizes for itself rather than one the caller adds.
+///
+/// Declaration-only: `common.render` is `None` and the pass records nothing. It
+/// exists so implicit per-frame work is expressed as ordinary graph
+/// declarations — currently `__imports`, which declares the access every
+/// imported resource carries into the frame so the hazard scan orders the first
+/// consumer against the previous frame.
+///
+/// Pinned to the universal queue by
+/// [`AnyRenderPass::queue_role`](super::graph::AnyRenderPass::queue_role).
+pub(crate) struct InternalPass {
     pub(super) common: PassCommonData,
 }
 
@@ -604,6 +865,7 @@ impl ComputeRenderPassBuilder {
         Ok(ComputeRenderPass {
             common,
             shaders: Some(shaders),
+            queue_affinity: ComputeQueueAffinity::default(),
         })
     }
 }

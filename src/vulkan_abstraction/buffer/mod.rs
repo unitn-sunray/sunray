@@ -13,6 +13,7 @@ pub use uniform_buffer::*;
 pub use vertex_buffer::*;
 
 use crate::render_graph::resource::ResourceDesc;
+use crate::vulkan_abstraction::Core;
 use crate::vulkan_abstraction::descriptor_heap::{DescriptorSlot, ResourceDescriptorKind};
 use crate::{error::*, vulkan_abstraction};
 use ash::vk;
@@ -21,7 +22,6 @@ use std::cell::Cell;
 use std::fmt::{Debug, Formatter};
 use std::rc::Rc;
 use std::sync::Arc;
-use crate::vulkan_abstraction::Core;
 
 //TODO revert capacity as vk::device length some methods signatures
 //TODO should gpu only buffer have a generic and some methods can be moved inside the buffer trait like new,new with data ecc.. with a default impl
@@ -115,11 +115,11 @@ impl Buffer for RawBuffer {
     }
 
     fn byte_size(&self) -> DeviceSize {
-       self.byte_size
+        self.byte_size
     }
 
     fn is_null(&self) -> bool {
-       self.buffer.is_null()
+        self.buffer.is_null()
     }
 
     fn get_device_address(&self) -> DeviceAddress {
@@ -141,7 +141,6 @@ impl Buffer for RawBuffer {
         }
     }
 }
-
 
 // `RawBuffer` can't `#[derive(Debug)]`: its `core: Rc<Core>` field doesn't
 // implement `Debug` (and `Allocation` / the `Cell` slots aren't worth printing).
@@ -224,8 +223,6 @@ impl RawBuffer {
         })
     }
 
-   
-
     /// Create a bare `vk::Buffer` handle and report its memory requirements without
     /// allocating or binding any memory. Counterpart to `Image::create_unbound`;
     /// used by the render-graph transient allocator.
@@ -262,7 +259,6 @@ impl RawBuffer {
             owns_memory: false,
         })
     }
-    
 
     /// GPU device address of this buffer. Requires the buffer to have been
     /// created with `SHADER_DEVICE_ADDRESS` usage; returns 0 for a null buffer.
@@ -516,7 +512,6 @@ impl crate::render_graph::graph::RgImportable<BufferDesc> for Arc<RawBuffer> {
     }
 }
 
-
 impl From<Arc<RawBuffer>> for crate::render_graph::graph::GraphResourceImportInfo {
     fn from(val: Arc<RawBuffer>) -> Self {
         crate::render_graph::graph::GraphResourceImportInfo::Buffer {
@@ -526,8 +521,6 @@ impl From<Arc<RawBuffer>> for crate::render_graph::graph::GraphResourceImportInf
         }
     }
 }
-
-
 
 #[derive(Clone, Debug)]
 pub struct BufferDesc {

@@ -1,7 +1,9 @@
+use crate::MAX_FRAMES_IN_FLIGHT;
 use crate::error::{ErrorSource, SrError, SrResult};
 use crate::render_graph::error::GraphError;
 use crate::render_graph::pass_builder::{
-    ComputeRenderPass, PassCommonDataBuilder, RasterRenderPass, RaytracingRenderPass, TransferPass,
+    ComputeQueueAffinity, ComputeRenderPass, CopyEnd, InternalPass, PassCommonData, PassCommonDataBuilder, RasterRenderPass,
+    RaytracingRenderPass, TransferPass, TransferPassBuilder, check_copy_bounds,
 };
 pub(crate) use crate::render_graph::resource::{
     GraphResourceDesc, GraphResourceImportInfo, GraphResourceInfo, Handle, Resource, ResourceDesc, RgImportable,
@@ -9,13 +11,12 @@ pub(crate) use crate::render_graph::resource::{
 use crate::render_graph::transient_resources::TransientResources;
 use crate::vulkan_abstraction::{
     AccelerationStructure, AsBuildJob, Buffer, CmdBuffer, ComputePipeline, Core, GpuOnlyBuffer, GraphicsPipeline,
-    GraphicsPipelineShaders, HeapComputePass, Image, Pipeline, RawBuffer, RayTracingPipeline, RayTracingPipelineShaders,
-    ShaderBindingTable, TimelineSemaphore,
+    GraphicsPipelineShaders, HeapComputePass, Image, Pipeline, QueueRole, RawBuffer, RayTracingPipeline,
+    RayTracingPipelineShaders, ShaderBindingTable, TimelineSemaphore,
 };
-use crate::MAX_FRAMES_IN_FLIGHT;
 use ash::vk;
 use petgraph::visit::EdgeRef;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use vk_sync_fork as vk_sync;
 use vk_sync_fork::AccessType;
 
 #[derive(Copy, Clone, Debug)]
+//TODO this is basically unused or misused
 pub enum PassResourceAccessSyncType {
     AlwaysSync,
     SkipSyncIfSameAccessType,
@@ -40,6 +42,52 @@ pub(super) enum AnyRenderPass {
     Raster(RasterRenderPass),
     Compute(ComputeRenderPass),
     Transfer(TransferPass),
+    Internal(InternalPass),
+}
+
+impl AnyRenderPass {
+    pub(super) fn common(&self) -> &PassCommonData {
+        match self {
+            AnyRenderPass::Rt(p) => &p.common,
+            AnyRenderPass::Raster(p) => &p.common,
+            AnyRenderPass::Compute(p) => &p.common,
+            AnyRenderPass::Transfer(p) => &p.common,
+            AnyRenderPass::Internal(p) => &p.common,
+        }
+    }
+
+    pub(super) fn common_mut(&mut self) -> &mut PassCommonData {
+        match self {
+            AnyRenderPass::Rt(p) => &mut p.common,
+            AnyRenderPass::Raster(p) => &mut p.common,
+            AnyRenderPass::Compute(p) => &mut p.common,
+            AnyRenderPass::Transfer(p) => &mut p.common,
+            AnyRenderPass::Internal(p) => &mut p.common,
+        }
+    }
+
+    /// Which queue this pass belongs on. Queue is a function of pass kind —
+    /// raster and ray tracing need the universal queue, buffer copies belong on
+    /// the DMA queue, and internal nodes stay universal (the present blit will
+    /// live there, and presenting requires a present-capable queue). Compute is
+    /// the only genuine choice, so it is the only kind carrying an affinity.
+    ///
+    /// TODO nothing consumes this yet: the graph still records every pass into
+    /// one command buffer and submits it to the graphics queue
+    /// (`submit_current`). It exists so multi-queue becomes a change to the
+    /// scheduler rather than to every pass constructor.
+    #[allow(dead_code)]
+    pub(super) fn queue_role(&self) -> QueueRole {
+        match self {
+            AnyRenderPass::Rt(_) | AnyRenderPass::Raster(_) | AnyRenderPass::Internal(_) => QueueRole::Graphics,
+            AnyRenderPass::Transfer(_) => QueueRole::Transfer,
+            AnyRenderPass::Compute(p) => match p.queue_affinity {
+                ComputeQueueAffinity::AsyncCompute => QueueRole::AsyncCompute,
+                // `Inferred` resolves to the universal queue until the scheduler exists.
+                ComputeQueueAffinity::Universal | ComputeQueueAffinity::Inferred => QueueRole::Graphics,
+            },
+        }
+    }
 }
 
 /// Lightweight reference to a pipeline interned in the graph's [`PipelineCache`].
@@ -397,17 +445,21 @@ impl RenderGraph {
     /// Hand the graph a batch of arena staging→GPU buffer copies to record as a
     /// transfer prologue pass. Each destination is an arena buffer imported into
     /// *this* build (see `ResourceManager::import_to_graph`).
-    pub fn add_prologue_buffer_copies(
+    ///
+    /// # Safety
+    /// The sources are untracked by the graph: it declares nothing for them and
+    /// emits no barriers on their behalf. Each must outlive this frame's graph
+    /// submission, must not alias a graph-tracked resource, and is the caller's
+    /// to synchronize against non-graph work.
+    pub unsafe fn add_prologue_buffer_copies(
         &mut self,
-        mut copies: Vec<(
-            vk::Buffer,
-            Handle<RawBuffer>,
-            vk::BufferCopy,
-        )>,
-    ) {
-        self.prologue_copies.append(
-            &mut copies
-        );
+        copies: Vec<(&impl Buffer, Handle<RawBuffer>, vk::BufferCopy)>,
+    ) -> SrResult<()> {
+        for (src, dst, region) in copies {
+            check_copy_bounds("source", "arena staging", src.byte_size(), region.src_offset, &region)?;
+            self.prologue_copies.push((src.inner(), dst, region));
+        }
+        Ok(())
     }
 
     /// Clear all per-frame state (passes, virtual resources, transient bindings,
@@ -689,6 +741,11 @@ impl RenderGraph {
         for dep in deps {
             common.read(dep, vk_sync::AccessType::AccelerationStructureBuildRead)?;
         }
+        // An AS build is compute work, not a buffer copy: it records
+        // `cmd_build_acceleration_structures` and needs a COMPUTE-capable queue,
+        // so it must not be a `TransferPass` (those are DMA-queue buffer copies,
+        // and carry no render closure at all). `Inferred` because an AS build is
+        // a genuine async-compute candidate once the scheduler can place it.
 
         // The job is `FnOnce`; the render closure is `FnMut`, so take it out on the
         // first (only) invocation. `scratch` is owned by the closure and outlives
@@ -701,8 +758,11 @@ impl RenderGraph {
             Ok(())
         });
 
-        let pass = common.build_transfer();
-        self.add_render_pass(pass);
+        self.add_render_pass(ComputeRenderPass {
+            common: common.build(),
+            shaders: None,
+            queue_affinity: ComputeQueueAffinity::Inferred,
+        });
         Ok(())
     }
 
@@ -757,6 +817,35 @@ impl RenderGraph {
         })
     }
 
+    /// Record a [`TransferPass`]'s copy list. `CopyEnd::Handle` endpoints are
+    /// resolved through `tr`; `CopyEnd::Raw` endpoints are passed through as-is
+    /// (their validity is the caller's `unsafe` obligation — see
+    /// [`TransferPassBuilder`]). Barriers around these copies come from the
+    /// declarations the builder made, not from here.
+    fn record_buffer_copies(
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        copies: &[(CopyEnd, CopyEnd, vk::BufferCopy)],
+        tr: &TransientResources,
+    ) -> SrResult<()> {
+        let resolve = |end: &CopyEnd| -> SrResult<vk::Buffer> {
+            match end {
+                CopyEnd::Raw(buffer) => Ok(*buffer),
+                CopyEnd::Handle(id) => tr.buffer_by_id(*id).ok_or_else(|| {
+                    SrError::new(
+                        ErrorSource::RenderGraph(GraphError::InvalidResourceRef),
+                        format!("transfer pass copies to/from unknown buffer resource id {id}"),
+                    )
+                }),
+            }
+        };
+        for (src, dst, region) in copies {
+            let (src, dst) = (resolve(src)?, resolve(dst)?);
+            unsafe { device.cmd_copy_buffer(cb, src, dst, std::slice::from_ref(region)) };
+        }
+        Ok(())
+    }
+
     /// Bare `vkCmdBlitImage` from `src` (already in TRANSFER_SRC) to `dst` (already
     /// in TRANSFER_DST) — the caller owns the surrounding layout barriers. Scales if
     /// the extents differ (nearest). Used by [`Self::run_present`].
@@ -801,6 +890,70 @@ impl RenderGraph {
         }
     }
 
+    /// Build the nodes the graph synthesizes for itself and prepend them to
+    /// `self.passes`. Called once at the top of [`Self::compile`], before the
+    /// hazard scan.
+    ///
+    /// Front placement is load-bearing: the hazard scan is a linear walk in
+    /// insertion order that only ever adds edges from an already-seen pass, so
+    /// an internal node placed at the back would be ordered *after* its
+    /// consumers by WAR edges rather than before them.
+    fn build_internal_passes(&mut self) -> SrResult<()> {
+        let mut internal: Vec<AnyRenderPass> = Vec::new();
+
+        // `__imports`: declare the access every imported resource carries into
+        // this frame — the state the previous frame's submission left it in,
+        // threaded back by the caller (or by the temporal write-back below).
+        //
+        // As ordinary declarations these feed the hazard scan directly, so the
+        // first consumer of each import is ordered against the previous frame
+        // with no special case in `compile`. A declared *write* (or `Nothing`)
+        // sets `last_writer`, so the first consumer gets a RAW/WAW barrier; a
+        // declared *read* followed by another read produces no barrier at all,
+        // which is correct and which the loop this replaced could not express —
+        // it always emitted one.
+        // Samplers are excluded: they have no memory contents, so they never need
+        // a barrier — declaring one would only produce a global barrier for an id
+        // that resolves to neither an image nor a buffer.
+        let imported: Vec<(u32, AccessType)> = self
+            .virtual_resources
+            .iter()
+            .enumerate()
+            .filter_map(|(id, info)| match info {
+                GraphResourceInfo::Imported(GraphResourceImportInfo::Sampler { .. }) => None,
+                GraphResourceInfo::Imported(import) => Some((id as u32, imported_initial_access(import))),
+                GraphResourceInfo::Created(_) => None,
+            })
+            .collect();
+
+        if !imported.is_empty() {
+            let mut builder = PassCommonDataBuilder::new(self, "__imports");
+            for (id, access) in imported {
+                builder.declare_previous_imports(id, access);
+            }
+            internal.push(AnyRenderPass::Internal(builder.build_internal()));
+        }
+
+        // Arena staging copies: raw `vk::Buffer` sources (owned by the staging
+        // arena, not the graph) into imported arena buffers.
+        if !self.prologue_copies.is_empty() {
+            let copies = std::mem::take(&mut self.prologue_copies);
+            let mut builder = TransferPassBuilder::new(self, "__prologue_copies");
+            for (src, dst, region) in copies {
+                // SAFETY: upheld by the caller of `add_prologue_buffer_copies`,
+                // which is itself `unsafe` for exactly this reason
+                unsafe { builder.copy_from_prechecked_raw(src, &dst, region)? };
+            }
+            internal.push(AnyRenderPass::Transfer(builder.build()));
+        }
+
+        if !internal.is_empty() {
+            internal.append(&mut self.passes);
+            self.passes = internal;
+        }
+        Ok(())
+    }
+
     pub fn compile(&mut self) -> SrResult<()> {
         //TODO force injection of previous temporal data on rebuild, the graph is incapable of understanding temporal dep across compilations
         //TODO mark the render pass goals as the result of the graph so anything unnecessary can be removed
@@ -811,45 +964,7 @@ impl RenderGraph {
         // for example you could build a tlas the next frame if this is seen as an internal or created on the spot data structure, but exporting it would block the cpu on interacting with it until the previous frame has ended.
         // To further emphasise this there will need to be a dedicated way to handle multiple data based of frames in flight , transformation matrices and the camera should only live as long as a frame.
 
-
-
-
-
-        if !self.prologue_copies.is_empty() {
-
-            let mut hashset = HashSet::new();
-            let mut prologue_copies_node_builder = PassCommonDataBuilder::new(self, "Internal prologue copy node");
-
-            for dst in self.prologue_copies.iter().map(|(_, dst, _)| dst) {
-                if hashset.insert(dst.id) {
-                    prologue_copies_node_builder.write(&dst, AccessType::TransferWrite)?;
-                }
-            }
-
-            let device_out = self.core.device().clone();
-            let prologue_copies_for_closure = self.prologue_copies.clone();
-            prologue_copies_node_builder.render(move |cmd_buffer, transient_resources| {
-                let device = device_out.inner();
-
-                unsafe {
-                    for (src, dst, region) in prologue_copies_for_closure.iter() {
-                        if let Some(dst_raw) = transient_resources.external_buffers.get(&dst.id) {
-                            device.cmd_copy_buffer(*cmd_buffer, *src, dst_raw.inner(), std::slice::from_ref(region));
-
-                        }else {
-                            return Err(SrError::new( ErrorSource::RenderGraph(GraphError::InvalidResourceRef), format!("External Buffer with id not found {:?}" , &dst.id)));
-                        }
-                    }
-                }
-                SrResult::Ok(())
-            });
-
-
-            self.passes.insert(
-                0,
-                AnyRenderPass::Transfer(prologue_copies_node_builder.build_transfer())
-            );
-        }
+        self.build_internal_passes()?;
 
         //From now on the graph passes should not be touched
 
@@ -868,12 +983,7 @@ impl RenderGraph {
         //TODO let mut initialization_node = AnyRenderPass::Compute();
 
         for (pass_id, pass) in self.passes.iter().enumerate() {
-            let common = match pass {
-                AnyRenderPass::Rt(rt) => &rt.common,
-                AnyRenderPass::Raster(raster) => &raster.common,
-                AnyRenderPass::Compute(compute) => &compute.common,
-                AnyRenderPass::Transfer(transfer) => &transfer.common,
-            };
+            let common = pass.common();
 
             for read in &common.read {
                 let res_id = read.id;
@@ -1038,30 +1148,12 @@ impl RenderGraph {
             }
         }
 
-        // Cross-frame init barriers for *imported* resources that come into this
-        // frame carrying a non-`Nothing` access (the state the previous frame's
-        // submission left them in, threaded back in by the caller — e.g. a TLAS an
-        // in-place update inherits as `RayTracingShaderReadAccelerationStructure`).
-        // The hazard graph only orders passes *within* this compile, so without
-        // this a resource whose first in-graph use conflicts with its prior-frame
-        // access (a build writing a just-traced TLAS) would be unsynchronized. This
-        // is what lets the caller drop the device-wide idle wait between frames.
-        for (res_id, usage) in &resource_usages {
-            let prev_access = match self.virtual_resources.get(*res_id as usize) {
-                Some(GraphResourceInfo::Imported(import)) => imported_initial_access(import),
-                _ => continue,
-            };
-            if prev_access == vk_sync::AccessType::Nothing {
-                continue;
-            }
-            if let Some((_, first_access)) = usage.usages.first() {
-                init_barriers.push(ResourceBarrier {
-                    resource_id: *res_id,
-                    prev_access,
-                    next_access: first_access.access_type,
-                });
-            }
-        }
+        // Cross-frame init barriers for *imported* resources used to be fabricated
+        // here. They are now ordinary declarations on the `__imports` node
+        // (`build_internal_passes`), so the hazard scan emits them like any other
+        // producer→consumer transition — including the case this loop could not
+        // express, where an import entered as a read and is read again and needs
+        // no barrier at all.
 
         if !init_barriers.is_empty() {
             self.transient_resources[slot].emit_barriers(&device, raw_cb, &init_barriers);
@@ -1069,7 +1161,7 @@ impl RenderGraph {
 
         // Pass names, gathered up front (the loop borrows `self.passes` mutably):
         // used both for GPU-capture labels and the optional graph dump below.
-        let pass_names: Vec<String> = self.passes.iter().map(pass_common_name).collect();
+        let pass_names: Vec<String> = self.passes.iter().map(|p| p.common().name.clone()).collect();
         // Pre-build nul-terminated labels only when a capture tool is active.
         let labels_on = self.core.debug_labels_enabled();
         let pass_clabels: Vec<Option<std::ffi::CString>> = if labels_on {
@@ -1111,15 +1203,21 @@ impl RenderGraph {
                     .cmd_begin_debug_label(raw_cb, pass_clabels[pass_id].as_ref().unwrap());
             }
 
-            let common = match &mut self.passes[pass_id] {
-                AnyRenderPass::Rt(rt) => &mut rt.common,
-                AnyRenderPass::Raster(raster) => &mut raster.common,
-                AnyRenderPass::Compute(compute) => &mut compute.common,
-                AnyRenderPass::Transfer(transfer) => &mut transfer.common,
-            };
-            if let Some(render) = common.render.as_mut() {
-                let mut cb_handle = raw_cb;
-                render(&mut cb_handle, &self.transient_resources[slot])?;
+            match &mut self.passes[pass_id] {
+                // Transfer passes are declarative — the graph records their
+                // copies itself so they stay re-targetable to the DMA queue.
+                AnyRenderPass::Transfer(transfer) => {
+                    Self::record_buffer_copies(&device, raw_cb, &transfer.copies, &self.transient_resources[slot])?;
+                }
+                // Declaration-only: `__imports` exists to feed the hazard scan,
+                // it records nothing.
+                AnyRenderPass::Internal(_) => {}
+                pass => {
+                    if let Some(render) = pass.common_mut().render.as_mut() {
+                        let mut cb_handle = raw_cb;
+                        render(&mut cb_handle, &self.transient_resources[slot])?;
+                    }
+                }
             }
 
             if has_label {
@@ -1485,17 +1583,6 @@ fn name_import(core: &Core, import: &GraphResourceImportInfo, name: &std::ffi::C
         GraphResourceImportInfo::Buffer { resource, .. } => core.set_debug_object_name(resource.inner(), name),
         GraphResourceImportInfo::RayTracingAcceleration { resource, .. } => core.set_debug_object_name(resource.inner(), name),
         GraphResourceImportInfo::Sampler { .. } => {}
-    }
-}
-
-/// The `PassCommonData::name` of any pass variant. Used for GPU-capture labels
-/// and the graph dump.
-fn pass_common_name(pass: &AnyRenderPass) -> String {
-    match pass {
-        AnyRenderPass::Rt(rt) => rt.common.name.clone(),
-        AnyRenderPass::Raster(r) => r.common.name.clone(),
-        AnyRenderPass::Compute(c) => c.common.name.clone(),
-        AnyRenderPass::Transfer(t) => t.common.name.clone(),
     }
 }
 

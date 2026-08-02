@@ -6,9 +6,9 @@ use ash::vk;
 
 use crate::MAX_FRAMES_IN_FLIGHT;
 use crate::error::*;
+use crate::render_graph::Handle;
 use crate::vulkan_abstraction;
 use crate::vulkan_abstraction::{BufferDesc, RawBuffer};
-use crate::render_graph::Handle;
 
 use super::{Buffer, GpuOnlyBuffer, HostAccessibleBuffer, StagingBuffer};
 
@@ -157,11 +157,7 @@ impl<T: Copy> ArenaGpuBuffer<T> {
             name,
         )?;
 
-        staging.clone_section_into_gpu_only_buffer(
-            0,
-            capacity * std::mem::size_of::<T>() as vk::DeviceSize,
-            &mut gpu_only,
-        )?;
+        staging.clone_section_into_gpu_only_buffer(0, capacity * std::mem::size_of::<T>() as vk::DeviceSize, &mut gpu_only)?;
 
         Ok(Self {
             staging,
@@ -243,8 +239,12 @@ impl<T: Copy> ArenaGpuBuffer<T> {
         self.gpu_only.inner()
     }
 
-    pub fn inner_staging(&self) -> vk::Buffer {
-        self.staging.inner()
+    /// The staging (host-visible) side of the arena — the *source* of a
+    /// staging→GPU copy. Returned as the buffer itself rather than a bare
+    /// `vk::Buffer` so callers can bounds-check a copy region against its
+    /// `byte_size` (see `TransferPassBuilder::copy_from_raw`).
+    pub fn staging(&self) -> &StagingBuffer<T> {
+        &self.staging
     }
 
     pub fn gpu_only(&self) -> &GpuOnlyBuffer {

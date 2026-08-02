@@ -8,11 +8,15 @@
 //!   - `graph_frame_<n>.txt` — the resource table (kind / size / aliasing slot /
 //!     **imported cross-frame access**) and the transient aliasing report.
 //!
-//! The cross-frame access column is the point of this tool for the current
-//! frame-overlap bug: an imported resource whose carried access is `Nothing`
-//! gets *no* cross-frame barrier (see `graph::compile`), so a producer→consumer
-//! hazard across the frame boundary goes unsynchronized. Those rows are marked
-//! `<== NO CROSS-FRAME BARRIER`.
+//! The cross-frame access column shows the access each imported resource is
+//! declared to carry into the frame by the `__imports` node (see
+//! `graph::build_internal_passes`), which is what the hazard scan orders its
+//! first consumer against. A row marked `<== enters UNDEFINED` carries
+//! `Nothing`: it still gets a barrier, but from UNDEFINED, so its previous
+//! contents are discarded. That is correct for a resource written first every
+//! frame and a bug for one meant to carry data across the frame boundary — such
+//! a resource needs its end state threaded back in via
+//! `RenderGraph::import_with_usage`.
 
 use std::fmt::Write as _;
 
@@ -106,7 +110,7 @@ impl GraphDump<'_> {
             match r.import_access {
                 Some(access) => {
                     let flag = if access == vk_sync::AccessType::Nothing {
-                        "   <== NO CROSS-FRAME BARRIER (imported as Nothing)"
+                        "   <== enters UNDEFINED (contents discarded)"
                     } else {
                         ""
                     };

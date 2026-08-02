@@ -2367,7 +2367,7 @@ dependencies = [
 [[package]]
 name = "gpu-allocator"
 version = "0.28.0"
-source = "git+https://github.com/MatteoBallardin/gpu-allocator.git#631d88d7f875241cf47ebd51b5d5e04ad24cec0d"
+source = "git+https://github.com/MatteoBallardin/gpu-allocator.git#fba6fb4138643d4e59c28fb68ff515221907c78e"
 dependencies = [
  "ash 0.38.0+1.4.352",
  "log",
@@ -5127,7 +5127,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vk-sync-fork"
 version = "0.5.2"
-source = "git+https://github.com/MatteoBallardin/vk-sync-rs.git?branch=1.4#7129f50d3eb62d04b69ec4c300b74327312dce8e"
+source = "git+https://github.com/MatteoBallardin/vk-sync-rs.git?branch=1.4#f8bfa6443271b7a6db3719d9540a9d76d8f5af80"
 dependencies = [
  "ash 0.38.0+1.4.352",
 ]
