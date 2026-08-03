@@ -71,8 +71,13 @@ impl Material {
                 material.emissive_strength,
             ],
 
-            alpha_mode: 0,
-            alpha_cutoff: 0.0,
+            // Matches the any-hit shader's test (0 == OPAQUE early-out).
+            alpha_mode: match material.alpha_mode {
+                gltf::material::AlphaMode::Opaque => 0,
+                gltf::material::AlphaMode::Mask => 1,
+                gltf::material::AlphaMode::Blend => 2,
+            },
+            alpha_cutoff: material.alpha_cutoff,
             transmission_factor: material.transmission_factor,
             ior: material.ior,
             _pad_mid: [0.0; 2],

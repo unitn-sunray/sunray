@@ -124,6 +124,11 @@ pub struct Blas {
     accel: Arc<AccelerationStructure>,
     geometry: BlasGeometry,
     desc: BlasDesc,
+    /// Whether the geometry is flagged `VK_GEOMETRY_OPAQUE_BIT_KHR`. False only
+    /// for alpha-cutout (glTF MASK) geometry, which must invoke the any-hit
+    /// shader; opaque geometry stays on the traversal fast path. Retained so
+    /// `rebuild`/`update` reproduce the same flag.
+    opaque: bool,
     #[allow(dead_code)]
     state: AsState,
     op: Option<OpType>,
@@ -133,13 +138,17 @@ impl Blas {
     /// the vertex_buffer is assumed to have a vec3 position attribute as its first (not necessarily the only) attribute in memory.
     /// Emissive triangles are no longer tracked here — the `ResourceManager` owns
     /// the per-BLAS emissive triangle slots.
+    /// `opaque` maps to `VK_GEOMETRY_OPAQUE_BIT_KHR`: pass `false` only for
+    /// alpha-cutout (glTF MASK) meshes so the any-hit shader runs on them; `true`
+    /// for everything else keeps them on the fixed-function traversal fast path.
     pub fn new(
         core: Arc<vulkan_abstraction::Core>,
         vertex_buffer: VertexBuffer,
         index_buffer: IndexBuffer,
+        opaque: bool,
         build_type: BuildType,
     ) -> SrResult<Self> {
-        Self::new_with_build_flags(core, vertex_buffer, index_buffer, Self::build_flags(build_type))
+        Self::new_with_build_flags(core, vertex_buffer, index_buffer, opaque, Self::build_flags(build_type))
     }
 
     /// Map a [`BuildType`] to its Vulkan build flags. PREFER_FAST_BUILD ->
@@ -167,10 +176,11 @@ impl Blas {
         core: Arc<vulkan_abstraction::Core>,
         vertex_buffer: VertexBuffer,
         index_buffer: IndexBuffer,
+        opaque: bool,
         flags: vk::BuildAccelerationStructureFlagsKHR,
     ) -> SrResult<Self> {
         let desc = BlasDesc {
-            geometries: vec![GeometrySource::Triangles(Self::triangle_desc(&vertex_buffer, &index_buffer))],
+            geometries: vec![GeometrySource::Triangles(Self::triangle_desc(&vertex_buffer, &index_buffer, opaque))],
             flags,
         };
 
@@ -183,6 +193,7 @@ impl Blas {
                 index_buffer,
             },
             desc,
+            opaque,
             state: AsState::Optimal,
             // Built synchronously here — no op is in flight for `mark_built` to observe.
             op: None,
@@ -203,11 +214,12 @@ impl Blas {
         core: Arc<vulkan_abstraction::Core>,
         vertex_buffer: VertexBuffer,
         index_buffer: IndexBuffer,
+        opaque: bool,
         build_type: BuildType,
     ) -> SrResult<(Self, AsBuildJob)> {
         let flags = Self::build_flags(build_type);
         let desc = BlasDesc {
-            geometries: vec![GeometrySource::Triangles(Self::triangle_desc(&vertex_buffer, &index_buffer))],
+            geometries: vec![GeometrySource::Triangles(Self::triangle_desc(&vertex_buffer, &index_buffer, opaque))],
             flags,
         };
 
@@ -227,6 +239,7 @@ impl Blas {
                     index_buffer,
                 },
                 desc,
+                opaque,
                 state,
                 op,
             },
@@ -260,9 +273,19 @@ impl Blas {
         self.op
     }
 
-    /// Build a [`TriangleGeometryDesc`] from a vertex + index buffer, using the
-    /// fixed geometry flags the renderer's triangle meshes use.
-    fn triangle_desc(vertex_buffer: &VertexBuffer, index_buffer: &IndexBuffer) -> TriangleGeometryDesc {
+    /// Build a [`TriangleGeometryDesc`] from a vertex + index buffer.
+    ///
+    /// Opaque geometry is committed by fixed-function traversal (no any-hit).
+    /// Cutout geometry drops OPAQUE so the any-hit alpha test runs, and keeps
+    /// NO_DUPLICATE_ANY_HIT_INVOCATION so a given triangle is tested at most
+    /// once per ray (the test is a pure function of the hit, so dedup is safe).
+    fn triangle_desc(vertex_buffer: &VertexBuffer, index_buffer: &IndexBuffer, opaque: bool) -> TriangleGeometryDesc {
+        let flags = if opaque {
+            vk::GeometryFlagsKHR::OPAQUE
+        } else {
+            vk::GeometryFlagsKHR::NO_DUPLICATE_ANY_HIT_INVOCATION
+        };
+
         TriangleGeometryDesc {
             vertex_address: vertex_buffer.get_device_address(),
             vertex_stride: vertex_buffer.stride() as u64,
@@ -271,8 +294,7 @@ impl Blas {
             index_address: index_buffer.get_device_address(),
             index_type: index_buffer.index_type(),
             primitive_count: (index_buffer.len() / 3) as u32,
-            //TODO why always opaque?
-            flags: vk::GeometryFlagsKHR::OPAQUE | vk::GeometryFlagsKHR::NO_DUPLICATE_ANY_HIT_INVOCATION,
+            flags,
         }
     }
 
@@ -282,7 +304,7 @@ impl Blas {
 
     #[allow(unused)]
     pub fn rebuild(&mut self, vertex_buffer: VertexBuffer, index_buffer: IndexBuffer, build_type: BuildType) -> SrResult<()> {
-        *self = Self::new(Arc::clone(self.accel.core()), vertex_buffer, index_buffer, build_type)?;
+        *self = Self::new(Arc::clone(self.accel.core()), vertex_buffer, index_buffer, self.opaque, build_type)?;
         log::debug!("BLAS rebuilt");
         Ok(())
     }
@@ -295,7 +317,7 @@ impl Blas {
 
         // Same geometry count / layout, new buffer contents.
         let desc = BlasDesc {
-            geometries: vec![GeometrySource::Triangles(Self::triangle_desc(&vertex_buffer, &index_buffer))],
+            geometries: vec![GeometrySource::Triangles(Self::triangle_desc(&vertex_buffer, &index_buffer, self.opaque))],
             flags: self.desc.flags,
         };
         self.accel.update_sync(desc.realize())?;

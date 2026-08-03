@@ -138,6 +138,7 @@ impl Scene {
                             core.clone(),
                             primitive_data.vertex_buffer,
                             primitive_data.index_buffer,
+                            !primitive.material.is_alpha_cutout(),
                             vulkan_abstraction::BuildType::Static,
                         )?;
 

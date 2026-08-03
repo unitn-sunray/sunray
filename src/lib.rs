@@ -907,6 +907,7 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
             Arc::clone(&self.core),
             vertex_buffer,
             index_buffer,
+            !material.is_alpha_cutout(),
             vulkan_abstraction::BuildType::Static,
         )?;
 
