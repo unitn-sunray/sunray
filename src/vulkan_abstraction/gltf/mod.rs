@@ -219,7 +219,11 @@ impl Gltf {
                 let metallic_factor = material_pbr.metallic_factor();
                 let roughness_factor = material_pbr.roughness_factor();
                 let emissive_factor = material.emissive_factor();
-                let emissive_strength = material.emissive_strength().unwrap_or(0.0);
+                // glTF spec: when KHR_materials_emissive_strength is absent the
+                // multiplier is 1.0 (emission == emissiveFactor), not 0. Defaulting
+                // to 0 zeroed every emitter lacking the extension — e.g. all of
+                // Bistro's textured lights rendered as black surfaces.
+                let emissive_strength = material.emissive_strength().unwrap_or(1.0);
                 let alpha_mode = material.alpha_mode();
                 let alpha_cutoff = material.alpha_cutoff().unwrap_or(0.5);
                 let double_sided = material.double_sided();
@@ -269,7 +273,13 @@ impl Gltf {
 
                 let mut local_emissive_triangles = Vec::new();
 
-                let is_emissive = material.emissive_strength > 0.0 || material.emissive_factor != [0.0, 0.0, 0.0];
+                // Emission is `emissive_factor * emissive_strength`, so a material
+                // emits only when BOTH are non-zero. This must be `&&`, not `||`:
+                // `emissive_strength` now defaults to 1.0 (glTF spec) when the
+                // strength extension is absent, so an `||` here flags every
+                // material as emissive and floods the emissive-triangle arena with
+                // the entire scene.
+                let is_emissive = material.emissive_factor != [0.0, 0.0, 0.0] && material.emissive_strength > 0.0;
 
                 if is_emissive {
                     let reader = primitive.reader(|buffer| Some(&self.buffers[buffer.index()]));
