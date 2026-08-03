@@ -112,7 +112,12 @@ void ray_gen_ris() {
                 rayDir = refracted;
             }
             rayOrigin = hitPos + rayDir * 0.001;
-        } else if (metallic > 0.9 && roughness < 0.1) {
+        // Threshold must match ray_gen_final's `roughness > 0.2` rough-surface
+        // gate: a metallic surface below it never gets NEE/ReSTIR there (the walk
+        // just continues), so it must be followed here or the pixel's reservoirs
+        // are built for the wrong surface (or left empty by the same gate below)
+        // and the reflection resolves to black.
+        } else if (metallic > 0.9 && roughness <= 0.2) {
             rayOrigin = hitPos + hit_normal * 0.001;
             rayDir = reflect(rayDir, hit_normal);
         } else {
