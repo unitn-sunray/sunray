@@ -40,11 +40,23 @@ impl<T> StagingBuffer<T> {
         buffer_usage_flags: vk::BufferUsageFlags,
         name: &'static str,
     ) -> SrResult<Self> {
+        Self::new_aligned(core, len, 1, buffer_usage_flags, name)
+    }
+
+    /// Like `new`, but guarantees the buffer's device address is a multiple of
+    /// `alignment` (e.g. `shaderGroupBaseAlignment` for SBT buffers).
+    pub fn new_aligned(
+        core: Arc<vulkan_abstraction::Core>,
+        len: vk::DeviceSize,
+        alignment: u64,
+        buffer_usage_flags: vk::BufferUsageFlags,
+        name: &'static str,
+    ) -> SrResult<Self> {
         let byte_size = len * std::mem::size_of::<T>() as vk::DeviceSize;
         let raw = RawBuffer::new_aligned(
             core,
             byte_size,
-            1,
+            alignment,
             gpu_allocator::MemoryLocation::CpuToGpu,
             buffer_usage_flags,
             name,

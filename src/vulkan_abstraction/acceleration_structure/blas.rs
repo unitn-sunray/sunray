@@ -180,7 +180,11 @@ impl Blas {
         flags: vk::BuildAccelerationStructureFlagsKHR,
     ) -> SrResult<Self> {
         let desc = BlasDesc {
-            geometries: vec![GeometrySource::Triangles(Self::triangle_desc(&vertex_buffer, &index_buffer, opaque))],
+            geometries: vec![GeometrySource::Triangles(Self::triangle_desc(
+                &vertex_buffer,
+                &index_buffer,
+                opaque,
+            ))],
             flags,
         };
 
@@ -219,7 +223,11 @@ impl Blas {
     ) -> SrResult<(Self, AsBuildJob)> {
         let flags = Self::build_flags(build_type);
         let desc = BlasDesc {
-            geometries: vec![GeometrySource::Triangles(Self::triangle_desc(&vertex_buffer, &index_buffer, opaque))],
+            geometries: vec![GeometrySource::Triangles(Self::triangle_desc(
+                &vertex_buffer,
+                &index_buffer,
+                opaque,
+            ))],
             flags,
         };
 
@@ -304,7 +312,13 @@ impl Blas {
 
     #[allow(unused)]
     pub fn rebuild(&mut self, vertex_buffer: VertexBuffer, index_buffer: IndexBuffer, build_type: BuildType) -> SrResult<()> {
-        *self = Self::new(Arc::clone(self.accel.core()), vertex_buffer, index_buffer, self.opaque, build_type)?;
+        *self = Self::new(
+            Arc::clone(self.accel.core()),
+            vertex_buffer,
+            index_buffer,
+            self.opaque,
+            build_type,
+        )?;
         log::debug!("BLAS rebuilt");
         Ok(())
     }
@@ -317,7 +331,11 @@ impl Blas {
 
         // Same geometry count / layout, new buffer contents.
         let desc = BlasDesc {
-            geometries: vec![GeometrySource::Triangles(Self::triangle_desc(&vertex_buffer, &index_buffer, self.opaque))],
+            geometries: vec![GeometrySource::Triangles(Self::triangle_desc(
+                &vertex_buffer,
+                &index_buffer,
+                self.opaque,
+            ))],
             flags: self.desc.flags,
         };
         self.accel.update_sync(desc.realize())?;

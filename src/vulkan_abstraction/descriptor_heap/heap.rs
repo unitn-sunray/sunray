@@ -187,6 +187,7 @@ impl DescriptorHeap {
             allocator,
             resource_byte_size,
             app_resource_byte_size,
+            props.resource_heap_alignment.max(1),
             image_size,
             buffer_size,
             image_section_base_index,
@@ -203,6 +204,7 @@ impl DescriptorHeap {
             allocator,
             sampler_byte_size,
             app_sampler_byte_size,
+            props.sampler_heap_alignment.max(1),
             sampler_size,
             sampler_stride,
             sampler_capacity,
@@ -467,6 +469,7 @@ impl ResourceSubHeap {
         allocator: &mut Allocator,
         byte_size: u64,
         app_byte_size: u64,
+        heap_alignment: u64,
         image_descriptor_size: u64,
         buffer_descriptor_size: u64,
         image_section_base_index: u32,
@@ -477,7 +480,8 @@ impl ResourceSubHeap {
         buffer_capacity: u32,
         name: &'static str,
     ) -> SrResult<Self> {
-        let (buffer, allocation, device_address, mapped) = create_heap_buffer(device, allocator, byte_size, name)?;
+        let (buffer, allocation, device_address, mapped) =
+            create_heap_buffer(device, allocator, byte_size, heap_alignment, name)?;
         Ok(Self {
             buffer,
             allocation,
@@ -521,12 +525,14 @@ impl SamplerSubHeap {
         allocator: &mut Allocator,
         byte_size: u64,
         app_byte_size: u64,
+        heap_alignment: u64,
         descriptor_size: u64,
         stride: u64,
         capacity: u32,
         name: &'static str,
     ) -> SrResult<Self> {
-        let (buffer, allocation, device_address, mapped) = create_heap_buffer(device, allocator, byte_size, name)?;
+        let (buffer, allocation, device_address, mapped) =
+            create_heap_buffer(device, allocator, byte_size, heap_alignment, name)?;
         Ok(Self {
             buffer,
             allocation,
@@ -542,10 +548,12 @@ impl SamplerSubHeap {
 }
 
 fn create_heap_buffer(
-    //TODO i'll assume gpu allocator is taking care of the allignment of the buffer
     device: &ash::Device,
     allocator: &mut Allocator,
     byte_size: u64,
+    // Heap addresses must be multiples of resourceHeapAlignment/samplerHeapAlignment,
+    // which can exceed the buffer's own memory-requirements alignment on some drivers.
+    heap_alignment: u64,
     name: &'static str,
 ) -> SrResult<(vk::Buffer, Allocation, vk::DeviceAddress, NonNull<u8>)> {
     let mut usage2 = vk::BufferUsageFlags2CreateInfo::default()
@@ -558,6 +566,7 @@ fn create_heap_buffer(
 
     let buffer = unsafe { device.create_buffer(&buf_info, None) }?;
     let mem_reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let mem_reqs = mem_reqs.alignment(mem_reqs.alignment.max(heap_alignment));
 
     let mut allocation = allocator.allocate(&AllocationCreateDesc {
         name,
