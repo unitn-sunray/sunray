@@ -130,6 +130,7 @@ impl<T: Copy> ArenaGpuBuffer<T> {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn new_from_data(
         core: Rc<vulkan_abstraction::Core>,
         data: &[T],
