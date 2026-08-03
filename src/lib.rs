@@ -8,10 +8,6 @@ pub mod utils;
 pub mod vulkan_abstraction;
 
 /// Bevy 0.19 plugin that drives this renderer from inside a Bevy `App`.
-///
-/// Gated behind the `bevy` feature. See `docs/bevy_integration.md` for the
-/// architecture and `examples/bevy_app` for usage. Declared after `utils` so the
-/// `include_bytes_align_as!` macro is in textual scope.
 #[cfg(feature = "bevy")]
 pub mod bevy_integration;
 
@@ -24,7 +20,7 @@ use crate::render_graph::graph::{ExportedTemporalResource, RenderGraph};
 use crate::render_graph::pass_builder::{
     ComputeRenderPassBuilder, ComputeShaders, PassCommonDataBuilder, RayTracingShaders, RaytracingRenderPassBuilder, ShaderSource,
 };
-use crate::utils::env_var_as_bool;
+use crate::utils::{env_var_as_bool, ENABLE_GPUAV, ENABLE_NSIGHT, ENABLE_NVIDIA_AFTERMATH, ENABLE_VALIDATION_LAYER, IS_DEBUG_BUILD, SERIALIZE_FRAMES};
 use crate::vulkan_abstraction::image::swapchain::{Surface, Swapchain};
 use crate::vulkan_abstraction::swapchain::{SwapchainData, SwapchainFrame};
 use crate::vulkan_abstraction::{Buffer, HostAccessibleBuffer, PostprocessPushConstant, Reservoir, ReservoirGI};
@@ -246,16 +242,16 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         instance_exts: &'static [*const i8],
         create_surface: Option<&CreateSurfaceFn>,
     ) -> SrResult<Self> {
-        let with_validation_layer = env_var_as_bool(ENABLE_VALIDATION_LAYER_ENV_VAR).unwrap_or(IS_DEBUG_BUILD);
-        let with_gpuav = env_var_as_bool(ENABLE_GPUAV_ENV_VAR_NAME).unwrap_or(false);
-        // Select the GPU diagnostic backend from env. `ENABLE_NSIGHT` forces
+        let with_validation_layer = env_var_as_bool(ENABLE_VALIDATION_LAYER).unwrap_or(IS_DEBUG_BUILD);
+        let with_gpuav = env_var_as_bool(ENABLE_GPUAV).unwrap_or(false);
+        // Select the GPU diagnostic backend from env. `SUNRAY_ENABLE_NSIGHT` forces
         // VK_EXT_debug_utils on (even without validation) and emits per-pass
         // command-buffer labels + object names so an Nsight Graphics capture is
         // readable and can inspect the descriptor heap (which RenderDoc can't).
-        // `ENABLE_NVIDIA_AFTERMATH` (legacy) keeps the crash-dump path.
-        let diagnostics = if env_var_as_bool(ENABLE_NSIGHT_VAR_NAME).unwrap_or(false) {
+        // `SUNRAY_ENABLE_NVIDIA_AFTERMATH` (legacy) keeps the crash-dump path.
+        let diagnostics = if env_var_as_bool(ENABLE_NSIGHT).unwrap_or(false) {
             DiagnosticTool::NvidiaNsightGraphics
-        } else if env_var_as_bool(ENABLE_NVIDIA_AFTERMATH_VAR_NAME).unwrap_or(false) {
+        } else if env_var_as_bool(ENABLE_NVIDIA_AFTERMATH).unwrap_or(false) {
             DiagnosticTool::NvidiaAftermath
         } else {
             DiagnosticTool::None
@@ -1163,6 +1159,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         // overlap this frame's in-flight GPU work. ON BY DEFAULT.
         //
         // ponytail: serialized by default; opt into overlap with SUNRAY_SERIALIZE_FRAMES=0,
+        //           see `utils::SERIALIZE_FRAMES`;
         //           real fix is per-in-flight-slot duplication of every per-frame resource.
         //
         // Why: frame overlap causes an async use-after-free that crashes inside
@@ -1179,7 +1176,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         // CPU-record-ahead buys almost nothing. Properly fixing overlap needs
         // every per-frame-referenced resource duplicated per in-flight slot — a
         // rework to do only if profiling shows CPU-ahead actually matters.
-        if env_var_as_bool(SERIALIZE_FRAMES_VAR_NAME).unwrap_or(true) {
+        if env_var_as_bool(SERIALIZE_FRAMES).unwrap_or(true) {
             self.render_graph.wait_graph_timeline(frame_value)?;
         }
 
@@ -1940,14 +1937,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
     }
 }
 
-// useful environment variables, set to 1 or 0
-const ENABLE_VALIDATION_LAYER_ENV_VAR: &str = "ENABLE_VALIDATION_LAYER"; // defaults to 0 in debug build, to 1 in release build
-const ENABLE_GPUAV_ENV_VAR_NAME: &str = "ENABLE_GPUAV"; // does nothing unless validation layer is enabled, defaults to 0
-const ENABLE_NVIDIA_AFTERMATH_VAR_NAME: &str = "ENABLE_NVIDIA_AFTERMATH"; // does nothing unless validation layer is enabled, defaults to 0
-const ENABLE_NSIGHT_VAR_NAME: &str = "ENABLE_NSIGHT"; // forces debug-utils labels/naming for Nsight Graphics captures, defaults to 0
-const SERIALIZE_FRAMES_VAR_NAME: &str = "SUNRAY_SERIALIZE_FRAMES"; // whole-frame serialization; defaults to 1 (on). Set to 0 to opt into frame overlap (has a known async-UAF driver crash — see render()).
-const ENABLE_SHADER_DEBUG_SYMBOLS_ENV_VAR: &str = "ENABLE_SHADER_DEBUG_SYMBOLS"; // defaults to 0 in debug build, to 1 in release build
-const IS_DEBUG_BUILD: bool = cfg!(debug_assertions);
+
 
 impl<K: Hash + Eq + Copy + 'static> Drop for Renderer<K> {
     fn drop(&mut self) {

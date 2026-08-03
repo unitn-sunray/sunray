@@ -1,0 +1,21 @@
+# Defaults for the debug env vars documented in README.md ("Environment variables").
+# Cargo only applies these when the variable is *not* already set (no `force = true`),
+# so `SUNRAY_ENABLE_NSIGHT=1 cargo win` still wins from the shell.
+[env]
+# Note: this also turns validation on for release builds, where the library
+# default would be off. Comment it out to get the per-profile default back.
+SUNRAY_ENABLE_VALIDATION_LAYER = "1"
+SUNRAY_SERIALIZE_FRAMES = "1"
+# `1` dumps the per-frame render graph into <crate>/debug (git-ignored); `0` = off.
+SUNRAY_GRAPH_DUMP_DIR = "0"
+RUST_BACKTRACE = "1"
+
+# `-dbg` variants build the dev profile (debug assertions + symbols, slow);
+# the plain ones are release. Nothing else differs.
+[alias]
+win      = "run --release --example window"
+win-dbg  = "run --example window"
+png      = "run --release --example png"
+png-dbg  = "run --example png"
+bevy     = "run --release --example bevy_app --features bevy"
+bevy-dbg = "run --example bevy_app --features bevy"

@@ -32,6 +32,7 @@ pub struct Tlas {
 /// Plain-data description of a TLAS build (instances buffer address + count). No
 /// handles, no lifetimes — carried only as the phantom `Desc` on a
 /// `Handle<AccelerationStructure>` (see [`super::ASDesc`]).
+/// TODO this desc is lacking information like min size and actual size
 #[derive(Debug, Clone)]
 pub struct TlasBuildDesc {
     pub instances_address: vk::DeviceAddress,
@@ -112,12 +113,12 @@ impl Tlas {
         Ok(())
     }
 
-    /// In-place UPDATE of the TLAS from instances already written into
+    /// In-place SYNCHRONOUS UPDATE of the TLAS from instances already written into
     /// `instances_buffer` — same instance count / layout, new contents
     /// (transforms, BLAS references). Requires the TLAS was built with a
     /// [`BuildType`] that sets `ALLOW_UPDATE`. Mirrors `Blas::update`: cheaper
     /// than a full rebuild and, since an UPDATE keeps the same handle/address, the
-    /// heap slot stays valid so no re-point is needed. Synchronous.
+    /// heap slot stays valid so no re-point is needed.
     #[allow(unused)]
     pub fn update(&mut self, instance_count: u32, instances_buffer: &impl Buffer) -> SrResult<()> {
         if !Self::build_flags(self.build_type).contains(vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE) {

@@ -5,6 +5,48 @@ Rust hardware real time path-tracing library
 This project was developed by [Riccardo-Finello](https://github.com/riccardoFinelloUniTn) supervised by Professor [Marco Patrignani](https://squera.github.io/) for the bachelor thesis at the University of Trento, Italy
 <br>
 It's based on the [sunray](https://github.com/kalsifer-742/sunray) project developed by [kalsifer-742](https://github.com/kalsifer-742) and [circled-square](https://github.com/circled-square)
+## Environment variables
+
+The library takes no command-line arguments. Every knob below is a debug /
+diagnostic toggle read from the environment — anything that changes rendering
+behaviour is part of the `Renderer` API instead. Names live in one place,
+`src/utils.rs`.
+
+Booleans accept `1`/`0`, `true`/`false`, `on`/`off` (case-insensitive);
+an unrecognized value logs a warning and falls back to the default.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SUNRAY_ENABLE_VALIDATION_LAYER` | on in debug builds, off in release | Vulkan validation layer |
+| `SUNRAY_ENABLE_GPUAV` | off | GPU-assisted validation. No effect unless the validation layer is on |
+| `SUNRAY_ENABLE_NSIGHT` | off | Debug-utils labels + object names for readable Nsight Graphics captures. Takes precedence over `SUNRAY_ENABLE_NVIDIA_AFTERMATH` |
+| `SUNRAY_ENABLE_NVIDIA_AFTERMATH` | off | NVIDIA Aftermath crash dumps. The full user-space handler also needs the `nvidia-aftermath` feature |
+| `SUNRAY_SERIALIZE_FRAMES` | **on** | Whole-frame serialization. Set to `0` to opt into frame overlap — known async use-after-free crash inside the NVIDIA driver, see `Renderer::render` |
+| `SUNRAY_GRAPH_DUMP_DIR` | off | Per-frame render-graph dump (`.dot` + `.txt`). `1` writes into `<crate>/debug` (git-ignored); any other value is used as the destination directory |
+| `SUNRAY_SHADER_DEBUG` | off | **Build-time.** Disables shader optimization and emits maximal SPIR-V debug info so GPU debuggers resolve Slang source. Changing it re-runs the build script |
+
+Read once at `Renderer` construction, except `SUNRAY_GRAPH_DUMP_DIR` (per frame)
+and `SUNRAY_SHADER_DEBUG` (build script).
+
+`.cargo/config.toml` sets the common ones plus run aliases for the examples —
+`cargo win` / `cargo png` / `cargo bevy` build release, and the `-dbg` variants
+(`cargo win-dbg`, …) build the dev profile. The env values there are defaults
+only: a variable already set in your shell always wins.
+
+```sh
+SUNRAY_ENABLE_NSIGHT=1 cargo win
+SUNRAY_GRAPH_DUMP_DIR=1 cargo png   # dumps into ./debug
+SUNRAY_SHADER_DEBUG=1 cargo build
+```
+
+### Cargo features
+
+| Feature | Effect |
+|---|---|
+| *(default)* | none |
+| `nvidia-aftermath` | Links the NVIDIA Aftermath SDK for the user-space crash-dump handler. Without it, `SUNRAY_ENABLE_NVIDIA_AFTERMATH` still wires up the Vulkan-side diagnostics/checkpoint extensions |
+| `bevy` | Enables `sunray::bevy_integration` and the `bevy_app` example — see [docs/bevy_integration.md](docs/bevy_integration.md) |
+
 ## Contribution
 
 If you wish to contribute to the project you may check our issues, or if you found a bug or missing feature feel free to create one. 

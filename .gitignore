@@ -1,4 +1,5 @@
 /target
+/debug
 .idea
 .claude
 /examples/assets/heavy_models

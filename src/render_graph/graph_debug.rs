@@ -1,7 +1,7 @@
 //! Structured dump of a compiled render-graph frame for offline visualization.
 //!
-//! Emitted once per frame into `$SUNRAY_GRAPH_DUMP_DIR` (set the env var to a
-//! directory to enable; unset = zero cost). Two files per frame:
+//! Emitted once per frame into `$SUNRAY_GRAPH_DUMP_DIR` (set it to a directory,
+//! or to `1` to use `<crate>/debug`; unset = zero cost). Two files per frame:
 //!   - `graph_frame_<n>.dot` — Graphviz: passes as nodes, dependency edges
 //!     labeled with the barriers they carry, plus a `FRAME_ENTRY` node holding
 //!     the init / cross-frame barriers. Render with `dot -Tsvg`.
@@ -168,10 +168,15 @@ impl GraphDump<'_> {
         s
     }
 
-    /// Write both files into `dir`. Errors are logged, not propagated — dumping
-    /// is a diagnostic aid and must never fail a frame.
-    pub(crate) fn write_to(&self, dir: &str) {
-        let base = format!("{dir}/graph_frame_{:05}", self.frame);
+    /// Write both files into `dir`, creating it if needed. Errors are logged,
+    /// not propagated — dumping is a diagnostic aid and must never fail a frame.
+    pub(crate) fn write_to(&self, dir: &std::path::Path) {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            log::warn!("graph dump: failed to create {}: {e}", dir.display());
+            return;
+        }
+        let base = dir.join(format!("graph_frame_{:05}", self.frame));
+        let base = base.display();
         if let Err(e) = std::fs::write(format!("{base}.dot"), self.to_dot()) {
             log::warn!("graph dump: failed to write {base}.dot: {e}");
         }

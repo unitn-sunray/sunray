@@ -539,8 +539,7 @@ impl RenderGraph {
 
     /// Block until the graph timeline reaches `value` (the absolute frame count a
     /// frame's submission signals on completion). This is now the single
-    /// frame-completion timeline — the renderer's former separate `frame_timeline`
-    /// was collapsed into it once the present blit moved inside the graph submit.
+    /// frame-completion timeline
     pub fn wait_graph_timeline(&self, value: u64) -> SrResult<()> {
         self.graph_timeline.wait(value)
     }
@@ -1111,19 +1110,6 @@ impl RenderGraph {
             }
         }
 
-        // Linearize first: the epoch walk groups each resource's usages in
-        // *schedule* order, and the record loop below replays the same order.
-        let topo = kahn_toposort(&dep_graph)?;
-        let mut schedule_pos = vec![0usize; pass_count];
-        for (pos, pass_id) in topo.iter().enumerate() {
-            schedule_pos[*pass_id] = pos;
-        }
-
-        // Epoch walk: every barrier this frame issues, keyed to the pass it must
-        // precede, plus each resource's end state.
-        let (mut barriers_at, end_states) = Self::plan_barriers(&self.virtual_resources, &resource_usages, &schedule_pos);
-        self.resource_end_states = end_states;
-
         // Cross-frame sync for temporal (ping-pong / history) resources: thread
         // each backing's end access this frame back into its stored import, so
         // *next* frame's compile emits the read→write (or write→read) barrier for
@@ -1171,6 +1157,26 @@ impl RenderGraph {
         let components: Vec<PassComponent> = components_by_root.into_values().collect();
 
         self.transient_resources[slot].populate(Rc::clone(&self.core), &self.virtual_resources, &components, &resource_usages)?;
+
+        // Linearize: the epoch walk groups each resource's usages in *schedule*
+        // order, and the record loop below replays the same order.
+        let topo = kahn_toposort(&dep_graph)?;
+        let mut schedule_pos = vec![0usize; pass_count];
+        for (pos, pass_id) in topo.iter().enumerate() {
+            schedule_pos[*pass_id] = pos;
+        }
+
+        // Epoch walk: every barrier this frame issues, keyed to the pass it must
+        // precede, plus each resource's end state. Runs after `populate` because it
+        // needs the memory-slot assignment — two transient resources sharing a slot
+        // need a barrier between them (see `plan_barriers`).
+        let (mut barriers_at, end_states) = Self::plan_barriers(
+            &self.virtual_resources,
+            &resource_usages,
+            &schedule_pos,
+            &self.transient_resources[slot].resource_slots,
+        );
+        self.resource_end_states = end_states;
 
         let device = self.core.device().inner().clone();
         // This slot's command buffer was allocated in `RenderGraph::new`. Reset it
@@ -1255,7 +1261,7 @@ impl RenderGraph {
         // Optional per-frame graph dump (DOT + text) for offline visualization —
         // enabled by setting `SUNRAY_GRAPH_DUMP_DIR`. Cheap gate: only builds the
         // dump when the env var is present.
-        if let Ok(dir) = std::env::var("SUNRAY_GRAPH_DUMP_DIR") {
+        if let Some(dir) = crate::utils::graph_dump_dir() {
             self.dump_graph(&dir, &pass_names, &dep_graph, slot);
         }
 
@@ -1278,48 +1284,29 @@ impl RenderGraph {
     /// epoch being entered). Moving a barrier earlier could merge more of them —
     /// see the interval-stabbing note in the plan — but it would add an ordering
     /// constraint that was not otherwise implied, so it is deliberately not done.
+    /// `resource_slots` maps a transient resource to the memory slot backing it;
+    /// resources sharing a slot alias the same memory and need a barrier between
+    /// consecutive occupants, which is why this runs after `populate`.
     fn plan_barriers(
         virtual_resources: &[GraphResourceInfo],
         resource_usages: &BTreeMap<u32, ResourceLifetimeUsage>,
         schedule_pos: &[usize],
+        resource_slots: &HashMap<u32, u32>,
     ) -> (HashMap<usize, Vec<ResourceBarrier>>, HashMap<u32, ResourceEndState>) {
         let mut barriers_at: HashMap<usize, Vec<ResourceBarrier>> = HashMap::new();
         let mut end_states: HashMap<u32, ResourceEndState> = HashMap::new();
 
+        // ── Phase 1: real epochs, per resource ──────────────────────────────
+        let mut epochs_by_res: BTreeMap<u32, Vec<AccessEpoch>> = BTreeMap::new();
+
         for (res_id, info) in virtual_resources.iter().enumerate() {
             let res_id = res_id as u32;
-            let internal = matches!(info, GraphResourceInfo::Created(_));
             let is_image = matches!(
                 info,
                 GraphResourceInfo::Created(GraphResourceDesc::Image(_))
                     | GraphResourceInfo::Imported(GraphResourceImportInfo::Image { .. })
             );
-
             let mut epochs: Vec<AccessEpoch> = Vec::new();
-
-            // A created image's memory is bound fresh this frame, so it starts
-            // UNDEFINED and its first use needs a discarding transition. Seeding the
-            // walk replaces the standalone init-barrier loop: the transition now
-            // falls out as an ordinary epoch boundary, placed before the first
-            // consumer instead of all up front. Imports need no seed — `__imports`
-            // declared their incoming access as a real usage.
-            //
-            // ponytail: created *buffers* are not seeded, matching the previous
-            // behaviour (there are none today). Note that neither seeds an
-            // alias-reuse barrier — a transient resource reusing another's memory
-            // slot has an unhandled hazard against the previous occupant, which
-            // predates this change and is out of scope here.
-            if matches!(info, GraphResourceInfo::Created(GraphResourceDesc::Image(_))) {
-                epochs.push(AccessEpoch {
-                    accesses: vec![vk_sync::AccessType::Nothing],
-                    // Sentinel: the seed precedes every real pass, so it can never
-                    // collide with one in the same-pass check below.
-                    first_pass: usize::MAX,
-                    last_pass: usize::MAX,
-                    is_write: true,
-                    discard: true,
-                });
-            }
 
             if let Some(usage) = resource_usages.get(&res_id) {
                 // Stable sort by schedule position keeps a pass's reads ahead of its
@@ -1363,6 +1350,74 @@ impl RenderGraph {
                     }
                 }
             }
+            epochs_by_res.insert(res_id, epochs);
+        }
+
+        // ── Phase 2: seed each created resource ─────────────────────────────
+        // A created resource's memory is bound this frame, so whatever it contains
+        // belongs to someone else. Two cases:
+        //
+        //   * it is the *first* occupant of its slot — the memory is freshly
+        //     allocated, so only an image needs a transition (out of UNDEFINED) and
+        //     a buffer needs nothing;
+        //   * it *reuses* a slot — the previous occupant's last access must complete
+        //     and be made available before this one's first access, or the two
+        //     overlap in the same memory. `Nothing` alone cannot express that: its
+        //     stage mask is empty, so the barrier carries no execution dependency at
+        //     all and the new resource's write can start while the old one is still
+        //     being read.
+        //
+        // Aliased memory always discards: the previous occupant's layout says
+        // nothing about this one, so the transition must come out of UNDEFINED.
+        let alias_predecessor = Self::slot_predecessors(resource_slots, resource_usages);
+
+        for (res_id, info) in virtual_resources.iter().enumerate() {
+            let res_id = res_id as u32;
+            let is_created_image = matches!(info, GraphResourceInfo::Created(GraphResourceDesc::Image(_)));
+            if !matches!(info, GraphResourceInfo::Created(_)) {
+                // Imports need no seed — `__imports` declared their incoming access
+                // as a real usage.
+                continue;
+            }
+
+            let seed = match alias_predecessor.get(&res_id) {
+                Some(prev_res) => {
+                    let prev_end = epochs_by_res
+                        .get(prev_res)
+                        .and_then(|e| e.last())
+                        .map(|e| e.accesses.clone())
+                        .unwrap_or_default();
+                    if prev_end.is_empty() {
+                        continue;
+                    }
+                    Some(prev_end)
+                }
+                None if is_created_image => Some(vec![vk_sync::AccessType::Nothing]),
+                None => None,
+            };
+
+            if let Some(accesses) = seed {
+                let epochs = epochs_by_res.get_mut(&res_id).expect("every resource has an entry");
+                epochs.insert(
+                    0,
+                    AccessEpoch {
+                        accesses,
+                        // Sentinel: the seed precedes every real pass, so it can
+                        // never collide with one in the same-pass check below, and
+                        // the end-state scan can tell it apart from a real epoch.
+                        first_pass: usize::MAX,
+                        last_pass: usize::MAX,
+                        is_write: true,
+                        discard: true,
+                    },
+                );
+            }
+        }
+
+        // ── Phase 3: emit transitions and end states ────────────────────────
+        for (res_id, epochs) in &epochs_by_res {
+            let res_id = *res_id;
+            let internal = matches!(virtual_resources.get(res_id as usize), Some(GraphResourceInfo::Created(_)));
 
             for i in 1..epochs.len() {
                 let (prev, next) = (&epochs[i - 1], &epochs[i]);
@@ -1407,6 +1462,36 @@ impl RenderGraph {
         (barriers_at, end_states)
     }
 
+    /// For every transient resource that reuses a memory slot, the resource that
+    /// occupied that slot before it.
+    ///
+    /// `TransientResources::populate` only grants a slot to a new resource when the
+    /// current occupant's `last_pass` is strictly before the newcomer's
+    /// `first_pass`, so a slot's occupants form a non-overlapping sequence and
+    /// sorting them by `first_pass` recovers the order it assigned them in.
+    fn slot_predecessors(
+        resource_slots: &HashMap<u32, u32>,
+        resource_usages: &BTreeMap<u32, ResourceLifetimeUsage>,
+    ) -> HashMap<u32, u32> {
+        let mut by_slot: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (res_id, slot) in resource_slots {
+            by_slot.entry(*slot).or_default().push(*res_id);
+        }
+
+        let mut predecessor = HashMap::new();
+        for occupants in by_slot.values_mut() {
+            if occupants.len() < 2 {
+                continue;
+            }
+            // Same key `populate` sorted by, so this reproduces its ordering.
+            occupants.sort_by_key(|r| resource_usages.get(r).map_or(usize::MAX, |u| u.first_pass));
+            for pair in occupants.windows(2) {
+                predecessor.insert(pair[1], pair[0]);
+            }
+        }
+        predecessor
+    }
+
     /// Return a `'static` checkpoint marker for `name`, leaking a fresh
     /// `CString` the first time each name is seen (pass names are a bounded set,
     /// so this leaks a handful of strings total over the program's life).
@@ -1424,7 +1509,7 @@ impl RenderGraph {
     /// `SUNRAY_GRAPH_DUMP_DIR` is set.
     fn dump_graph(
         &self,
-        dir: &str,
+        dir: &std::path::Path,
         pass_names: &[String],
         dep_graph: &petgraph::graph::DiGraph<usize, PassDependency>,
         slot: usize,
@@ -1839,7 +1924,7 @@ mod tests {
             ]),
         );
 
-        let (barriers, ends) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(6));
+        let (barriers, ends) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(6), &HashMap::new());
 
         let total: usize = barriers.values().map(|v| v.len()).sum();
         assert_eq!(total, 2, "W,R,R,R,W must produce 2 barriers, got {barriers:#?}");
@@ -1881,7 +1966,7 @@ mod tests {
             ]),
         );
 
-        let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(4));
+        let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(4), &HashMap::new());
 
         // seed->write, write->read(GENERAL), read(GENERAL)->read(SHADER_READ_ONLY)
         let total: usize = barriers.values().map(|v| v.len()).sum();
@@ -1902,7 +1987,7 @@ mod tests {
         let mut u = BTreeMap::new();
         u.insert(0, usages(&[(3, AccessType::ComputeShaderWrite)]));
 
-        let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(4));
+        let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(4), &HashMap::new());
 
         assert_eq!(barriers.len(), 1);
         let b = &barriers[&3][0];
@@ -1931,7 +2016,7 @@ mod tests {
             usages(&[(2, AccessType::ComputeShaderWrite), (5, AccessType::ComputeShaderReadOther)]),
         );
 
-        let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(6));
+        let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(6), &HashMap::new());
 
         assert_eq!(barriers.len(), 1, "both transitions belong at pass 5");
         assert_eq!(barriers[&5].len(), 2, "one per resource, merged at emission");
@@ -1957,7 +2042,7 @@ mod tests {
             ]),
         );
 
-        let (_, ends) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(5));
+        let (_, ends) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(5), &HashMap::new());
         let end = &ends[&0];
 
         assert_eq!(end.end_accesses.len(), 3, "all three trailing readers must be exported");
@@ -1966,6 +2051,52 @@ mod tests {
         assert!(end.end_accesses.contains(&AccessType::AnyShaderReadOther));
         assert_eq!(end.last_write, Some(AccessType::ComputeShaderWrite));
         assert_eq!(end.last_use_pass, Some(4));
+    }
+
+    /// Two transient resources sharing a memory slot alias the same bytes, so the
+    /// second occupant's first access must be ordered against the first occupant's
+    /// last one. Seeding it with `Nothing` is not enough: `Nothing` has an empty
+    /// stage mask, so the barrier carries no execution dependency and the new
+    /// resource's write can begin while the old one is still being read.
+    ///
+    /// The seed must therefore name the previous occupant's final accesses, and
+    /// still discard — the old layout says nothing about the new resource.
+    #[test]
+    fn aliased_slot_reuse_is_ordered_against_the_previous_occupant() {
+        let resources = vec![
+            GraphResourceInfo::Created(GraphResourceDesc::Image(image(64, "first"))),
+            GraphResourceInfo::Created(GraphResourceDesc::Image(image(64, "second"))),
+        ];
+        let mut u = BTreeMap::new();
+        // res 0 lives over passes 0..1, res 1 over 2..3 — disjoint, so `populate`
+        // hands them the same slot.
+        u.insert(
+            0,
+            usages(&[(0, AccessType::ComputeShaderWrite), (1, AccessType::ComputeShaderReadOther)]),
+        );
+        u.insert(1, usages(&[(2, AccessType::ComputeShaderWrite)]));
+
+        let mut slots = HashMap::new();
+        slots.insert(0u32, 0u32);
+        slots.insert(1u32, 0u32);
+
+        let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(4), &slots);
+
+        let seed = barriers[&2]
+            .iter()
+            .find(|b| b.resource_id == 1)
+            .expect("second occupant must get a barrier before its first use");
+        assert_eq!(
+            seed.prev,
+            vec![AccessType::ComputeShaderReadOther],
+            "the alias barrier must be sourced from the previous occupant's final access, not from Nothing"
+        );
+        assert!(seed.discard, "aliased memory carries no meaningful old layout");
+
+        // Without a shared slot the same graph seeds from `Nothing` instead.
+        let (plain, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(4), &HashMap::new());
+        let unaliased = plain[&2].iter().find(|b| b.resource_id == 1).expect("still needs a seed");
+        assert_eq!(unaliased.prev, vec![AccessType::Nothing]);
     }
 
     /// The fold decision in `emit_barriers` is "does the layout actually change".
