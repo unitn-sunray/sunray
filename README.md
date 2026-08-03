@@ -55,9 +55,9 @@ SUNRAY_SHADER_DEBUG=1 cargo build
 --all-targets`, `cargo test`. Compile-time only: a hosted runner can build the crate
 but can never run it, because the device requires `VK_EXT_descriptor_heap` and
 `VK_KHR_shader_untyped_pointers`, which neither lavapipe nor SwiftShader implement.
-Slang, the Vulkan loader and shaderc all come from a pinned LunarG SDK — pinned, not
-`latest`, because `build.rs` panics if the bundled Slang predates the
-`spvDescriptorHeapEXT` capability.
+Slang and the Vulkan loader both come from a pinned LunarG SDK — pinned, not `latest`,
+because `build.rs` panics if the bundled Slang predates the `spvDescriptorHeapEXT`
+capability.
 
 **`gpu`** (self-hosted, this project's Windows box) — everything that actually
 executes: `cargo test --release -- --include-ignored`, the offscreen `cargo png` render

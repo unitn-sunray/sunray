@@ -1094,28 +1094,12 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         let frame_value = *self.core.absolute_frame_count.borrow() as u64;
         debug_assert_eq!(frame_value, upcoming_frame);
 
-        // Any pending async transfer work the graph submission must wait on. The
-        // AS builds (TLAS + BLAS) are now recorded *inside* the graph and ordered
-        // against the RT trace by graph barriers, so they no longer contribute a
-        // wait here (this drains whatever other transfer producers may have queued;
-        // currently none).
-        let wait_semaphores = self.core.transfer_semaphores_mut().drain(..).collect::<Vec<_>>(); //TODO they should always be put inside a render graph frame.
-        let wait_stages = wait_semaphores
-            .iter()
-            .map(|_| vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR | vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR)
-            .collect::<Vec<_>>();
-
         // The graph's command buffer blits the post-process result into the output
-        // image and transitions it to the layout `dst_final` (in-submit). Async
-        // transfer producers (currently none) become extra waits on the submit;
-        // `graph_timeline = N` is the single "frame N complete" signal.
-        let transfer_waits = || -> Vec<(vk::Semaphore, u64, vk::PipelineStageFlags2)> {
-            wait_semaphores
-                .iter()
-                .zip(wait_stages.iter())
-                .map(|(sem, stage)| (*sem, 0, vk::PipelineStageFlags2::from_raw(stage.as_raw() as u64)))
-                .collect()
-        };
+        // image and transitions it to the layout `dst_final` (in-submit).
+        // `graph_timeline = N` is the single "frame N complete" signal. The AS
+        // builds (TLAS + BLAS) are recorded *inside* the graph and ordered against
+        // the RT trace by graph barriers, so there are no external transfer
+        // producers left to wait on here.
         match output {
             // Renderer finishes the present: blit → PRESENT_SRC, signal `present_sem`.
             FrameOutput::Present {
@@ -1123,8 +1107,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
                 acquire_sem,
                 present_sem,
             } => {
-                let mut extra_waits = transfer_waits();
-                extra_waits.push((acquire_sem, 0, vk::PipelineStageFlags2::TRANSFER));
+                let extra_waits = [(acquire_sem, 0, vk::PipelineStageFlags2::TRANSFER)];
                 let extra_signals = [(present_sem, 0, vk::PipelineStageFlags2::ALL_COMMANDS)];
                 self.render_graph
                     .run_present(&source_h, image, vk_sync::AccessType::Present, &extra_waits, &extra_signals)?;
@@ -1133,8 +1116,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
             // pass (waiting `graph_timeline >= N`) transitions to PRESENT_SRC and
             // signals present itself.
             FrameOutput::PresentOverlay { image, acquire_sem } => {
-                let mut extra_waits = transfer_waits();
-                extra_waits.push((acquire_sem, 0, vk::PipelineStageFlags2::TRANSFER));
+                let extra_waits = [(acquire_sem, 0, vk::PipelineStageFlags2::TRANSFER)];
                 self.render_graph
                     .run_present(&source_h, image, vk_sync::AccessType::General, &extra_waits, &[])?;
             }
@@ -1142,7 +1124,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
             // (single submit) now means body+blit done, so `wait_frame` covers it.
             FrameOutput::Offscreen { image } => {
                 self.render_graph
-                    .run_present(&source_h, image, vk_sync::AccessType::General, &transfer_waits(), &[])?;
+                    .run_present(&source_h, image, vk_sync::AccessType::General, &[], &[])?;
             }
         }
 

@@ -2,6 +2,6 @@ pub mod entity;
 pub mod material;
 pub mod reservoir;
 
-pub use entity::*;
+pub(crate) use entity::*;
 pub use material::*;
 pub(crate) use reservoir::*;

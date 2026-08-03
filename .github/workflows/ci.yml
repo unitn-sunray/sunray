@@ -13,12 +13,11 @@ jobs:
   check:
     runs-on: ubuntu-latest
     env:
-      # build.rs needs Slang, ash's `linked` feature needs the Vulkan loader, and
-      # shaderc-sys needs libshaderc — the LunarG SDK ships all three. Variable
-      # names mirror shell.nix, which is the known-good local reference.
+      # build.rs needs Slang and ash's `linked` feature needs the Vulkan loader —
+      # the LunarG SDK ships both. Variable names mirror shell.nix, which is the
+      # known-good local reference.
       SLANG_INCLUDE_DIR: ${{ github.workspace }}/vulkan-sdk/include
       SLANG_LIB_DIR: ${{ github.workspace }}/vulkan-sdk/lib
-      SHADERC_LIB_DIR: ${{ github.workspace }}/vulkan-sdk/lib
       LD_LIBRARY_PATH: ${{ github.workspace }}/vulkan-sdk/lib
     steps:
       - uses: actions/checkout@v4
@@ -46,10 +45,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # No `-D warnings` yet: the lib currently emits ~25 rustc warnings (dead
-      # code, private-interface, one deprecated field), so denying would make this
-      # job red on day one. Add `-- -D warnings` once that backlog is cleared.
-      - run: cargo clippy --all-targets
+      # Denies rustc lints (the crate is at zero) but allows clippy's own style
+      # lints, of which there are still 49 — mostly `Arc` that isn't Send+Sync,
+      # which is inherent to the Rc-based design, plus too_many_arguments and
+      # complex types.TODO Drop `-A clippy::all` once those are addressed.
+      # Flags after `--` apply to this crate only, not to dependencies.
+      - run: cargo clippy --all-targets -- -D warnings -A clippy::all
 
       # 9 device-free tests; the two Core::new ones are #[ignore]d and run in `gpu`.
       - run: cargo test

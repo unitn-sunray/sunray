@@ -34,10 +34,15 @@ pub enum PassResourceAccessSyncType {
 #[derive(Copy, Clone, Debug)]
 pub struct PassResourceAccessType {
     pub(crate) access_type: vk_sync::AccessType,
+    // Every construction site passes `AlwaysSync` and `plan_barriers` ignores it:
+    // the knob is declared but not yet wired into the barrier planner (see the
+    // TODO on the enum). Retained rather than deleted so wiring it up stays a
+    // local change; delete both if the planner is never going to consult it.
+    #[allow(dead_code)]
     pub(crate) sync_type: PassResourceAccessSyncType,
 }
 
-pub(super) enum AnyRenderPass {
+pub(crate) enum AnyRenderPass {
     Rt(RaytracingRenderPass),
     Raster(RasterRenderPass),
     Compute(ComputeRenderPass),
@@ -807,7 +812,7 @@ impl RenderGraph {
         }
     }
 
-    pub fn add_render_pass(&mut self, render_pass: impl Into<AnyRenderPass>) {
+    pub(crate) fn add_render_pass(&mut self, render_pass: impl Into<AnyRenderPass>) {
         self.passes.push(render_pass.into())
     }
 

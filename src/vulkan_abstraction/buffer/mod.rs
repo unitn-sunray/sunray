@@ -13,7 +13,6 @@ pub use uniform_buffer::*;
 pub use vertex_buffer::*;
 
 use crate::render_graph::resource::ResourceDesc;
-use crate::vulkan_abstraction::Core;
 use crate::vulkan_abstraction::descriptor_heap::{DescriptorSlot, ResourceDescriptorKind};
 use crate::{error::*, vulkan_abstraction};
 use ash::vk;

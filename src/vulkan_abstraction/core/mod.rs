@@ -12,7 +12,6 @@ use crate::vulkan_abstraction;
 use crate::vulkan_abstraction::Queue;
 use crate::vulkan_abstraction::diagnostics::DiagnosticTool;
 use crate::{CreateSurfaceFn, error::*};
-use ash::vk::Semaphore;
 use ash::{ext, khr, vk};
 use parking_lot::RawMutex;
 use parking_lot::lock_api::MutexGuard;
@@ -35,9 +34,6 @@ pub struct Core {
     descriptor_heap: RefCell<vulkan_abstraction::DescriptorHeap>,
 
     queues: vulkan_abstraction::Queues,
-
-    #[deprecated]
-    transfer_semaphores: RefCell<Vec<vk::Semaphore>>,
 
     allocator: RefCell<Allocator>,
 
@@ -176,7 +172,6 @@ impl Core {
                 descriptor_heap_instance,
                 descriptor_heap: RefCell::new(descriptor_heap),
                 queues,
-                transfer_semaphores: RefCell::new(vec![]),
             },
             surface_support.map(|(s, _)| s),
         ))
@@ -229,12 +224,6 @@ impl Core {
         self.allocator.borrow_mut()
     }
 
-    pub fn transfer_semaphores(&self) -> Ref<'_, Vec<Semaphore>> {
-        self.transfer_semaphores.borrow()
-    }
-    pub fn transfer_semaphores_mut(&self) -> RefMut<'_, Vec<Semaphore>> {
-        self.transfer_semaphores.borrow_mut()
-    }
     pub fn graphics_cmd_pool(&self) -> &vulkan_abstraction::CmdPool {
         self.queues.graphics_pool()
     }

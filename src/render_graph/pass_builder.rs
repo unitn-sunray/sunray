@@ -7,46 +7,7 @@ use crate::vulkan_abstraction::{Buffer, GraphicsPipelineShaders, Pipeline, RawBu
 use ash::vk;
 use ash::vk::CommandBuffer;
 use derive_builder::Builder;
-use std::collections::HashMap;
 use std::path::PathBuf;
-
-pub(crate) enum BindingElement {
-    //TODO maybe compile time check the value corresponds to the inserted one
-    RgResource {
-        resource: u32,
-    },
-
-    /// Buffer Device Address: Directly pass a 64-bit GPU pointer. TODO this is unsafe and suggested by gemini, this is a bda basically
-    /// Highly recommended for SSBOs in a modern bindless engine.
-    DeviceAddress {
-        resource: vk::DeviceMemory,
-    },
-}
-
-pub enum BindingIntent {
-    Single { name: &'static str },
-    ArrayElement { name: &'static str, array_index: u32 },
-}
-
-type DescriptorsLayout = HashMap<String, rspirv_reflect::DescriptorInfo>; //TODO rspirv_reflect does not support descriptor_heap
-
-type DescriptorOps = HashMap<BindingIntent, BindingElement>;
-pub struct RayTracingShaderDesc {
-    pub descriptor_operations: DescriptorOps,
-    pub(crate) shader: ShaderSource,
-}
-
-pub struct RasterShaderDesc {
-    //TODO
-    pub descriptor_operations: DescriptorOps,
-    pub(crate) shader: ShaderSource,
-    pub(crate) pipeline_stage: RasterPipelineStage,
-}
-
-pub struct ComputeShaderDesc {
-    pub descriptor_operations: DescriptorOps,
-    pub(crate) shader: ShaderSource,
-}
 
 pub(crate) struct PassCommonData {
     pub(crate) read: Vec<ResourceRef>,
@@ -112,7 +73,7 @@ impl PassCommonDataBuilder {
 
     /// Finalize the builder and consume it into the `PassCommonData` that the
     /// concrete pass builders embed.
-    pub fn build(self) -> PassCommonData {
+    pub(crate) fn build(self) -> PassCommonData {
         self.pass_common_data
     }
 
@@ -250,8 +211,13 @@ pub(crate) struct RaytracingRenderPass {
     /// its pipeline. `None` for passes whose `common.render` closure binds a
     /// pre-built (persistent) pipeline directly instead of going through
     /// `RaytracingRenderPassBuilder::generate_render`.
+    // Backs the generated `.shaders()` / `.trace_extent()` setters, which
+    // `generate_render` reads off the *builder* before the pipeline is cached.
+    // Nothing reads them off the built pass, but derive_builder needs the fields.
     #[builder(setter(strip_option), default)]
+    #[allow(dead_code)]
     pub(super) shaders: Option<RayTracingShaders>,
+    #[allow(dead_code)]
     pub(super) trace_extent: [u32; 3],
 }
 
@@ -410,6 +376,8 @@ pub(crate) struct RasterRenderPass {
     /// into its graphics pipeline. `None` for passes whose `common.render`
     /// closure binds a pre-built pipeline directly.
     #[builder(setter(strip_option), default)]
+    // See `RaytracingRenderPass::shaders` — backs the builder setter only.
+    #[allow(dead_code)]
     pub(super) shaders: Option<RasterShaders>,
 }
 
@@ -556,6 +524,8 @@ pub(crate) struct ComputeRenderPass {
     /// pre-built (persistent) pipeline directly instead of going through
     /// `ComputeRenderPassBuilder::generate_render`.
     #[builder(setter(strip_option), default)]
+    // See `RaytracingRenderPass::shaders` — backs the builder setter only.
+    #[allow(dead_code)]
     pub(super) shaders: Option<ComputeShaders>,
     /// Which queue this pass wants.
     #[builder(default)]
@@ -734,7 +704,7 @@ impl TransferPassBuilder {
         self.copies.is_empty()
     }
 
-    pub fn build(self) -> TransferPass {
+    pub(crate) fn build(self) -> TransferPass {
         TransferPass {
             common: self.common.build(),
             copies: self.copies,
@@ -875,13 +845,6 @@ pub enum RayTracingPipelineStage {
     RayGen,
     RayMiss,
     RayClosestHit,
-}
-
-#[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
-pub enum RasterPipelineStage {
-    //TODO check for missing since I don't raster yet like task, mesh, tessellation , geometry
-    Vertex,
-    Pixel,
 }
 
 pub trait ShaderDesc {}

@@ -110,14 +110,6 @@ impl App {
         self.res_mut().renderer.resize(size)
     }
 
-    fn time_elapsed(&self) -> f32 {
-        std::time::SystemTime::now()
-            .duration_since(self.start_time.unwrap())
-            .unwrap()
-            .as_millis() as f32
-            / 1000.0
-    }
-
     fn draw(&mut self) -> sunray::error::SrResult<()> {
         let now = Instant::now();
         let dt = if let Some(last) = self.last_frame_time {
