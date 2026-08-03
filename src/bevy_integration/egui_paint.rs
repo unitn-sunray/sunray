@@ -423,14 +423,5 @@ fn image_data_to_rgba(image: &egui::ImageData) -> (Vec<u8>, usize, usize) {
             }
             (out, w, h)
         }
-        egui::ImageData::Font(f) => {
-            let [w, h] = f.size;
-            let mut out = Vec::with_capacity(w * h * 4);
-            // Premultiplied sRGB; gamma=None uses egui's default.
-            for p in f.srgba_pixels(None) {
-                out.extend_from_slice(&p.to_array());
-            }
-            (out, w, h)
-        }
     }
 }

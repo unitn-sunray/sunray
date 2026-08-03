@@ -67,6 +67,26 @@ session; a Windows service can neither reach the GPU nor open a window. The job 
 gated to same-repo events, since a self-hosted runner reachable from a fork PR is
 remote code execution.
 
+**The `gpu` job is off by default.** It only runs when the repository variable
+`GPU_RUNNER` is set to `true` (Settings → Secrets and variables → Actions → Variables),
+which requires both repo admin and a registered self-hosted runner. While it is off the
+job is skipped rather than left queued — a job waiting on a runner that does not exist
+never finishes, which leaves every run stuck "in progress" and blocks log downloads.
+
+If you have not set up the local runner you can run the identical checks locally —
+same steps, pick whichever shell you're in:
+
+```powershell
+pwsh -File scripts/gpu-check.ps1   # Windows PowerShell also works
+```
+
+```sh
+./scripts/gpu-check.sh             # Linux, or Git Bash on Windows
+```
+
+Both mirror the `gpu` job step for step, and both need a real RT-capable GPU. If you
+change a step in one, change it in the other two.
+
 The two render-graph tests that construct a `Core` are marked `#[ignore]`, so a plain
 `cargo test` stays GPU-free; `--include-ignored` runs the full set.
 

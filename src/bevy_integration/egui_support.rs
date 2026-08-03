@@ -153,6 +153,7 @@ fn egui_begin(
         events.push(egui::Event::MouseWheel {
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(dx, dy),
+            phase: egui::TouchPhase::Move,
             modifiers,
         });
     }

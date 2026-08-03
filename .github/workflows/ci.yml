@@ -1,6 +1,6 @@
 name: CI
 
-on: [push, pull_request]
+on: [push, pull_request , workflow_dispatch]
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,15 +12,8 @@ jobs:
   # neither lavapipe nor SwiftShader implement. Execution happens in `gpu` below.
   check:
     runs-on: ubuntu-latest
-    env:
-      # build.rs needs Slang and ash's `linked` feature needs the Vulkan loader —
-      # the LunarG SDK ships both. Variable names mirror shell.nix, which is the
-      # known-good local reference.
-      SLANG_INCLUDE_DIR: ${{ github.workspace }}/vulkan-sdk/include
-      SLANG_LIB_DIR: ${{ github.workspace }}/vulkan-sdk/lib
-      LD_LIBRARY_PATH: ${{ github.workspace }}/vulkan-sdk/lib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Needs no build, so formatting breakage reports in seconds rather than
       # after the whole native-dep dance below.
@@ -43,6 +36,26 @@ jobs:
           destination: ${{ github.workspace }}/vulkan-sdk
           cache: true
 
+      # Probed rather than hardcoded: the Linux SDK nests everything under
+      # <dest>/<version>/x86_64/ and puts Slang's headers in their own
+      # subdirectory, and that layout has moved between SDK releases. Finding the
+      # files is version-proof; a hardcoded path is how the first run failed
+      # (shader-slang-sys panicked with NotExist on slang.h).
+      # Set via $GITHUB_ENV, not a job-level `env:` block, so there is no
+      # precedence ambiguity between the two.
+      - name: Locate the SDK's Slang
+        run: |
+          set -euo pipefail
+          inc=$(find "${{ github.workspace }}/vulkan-sdk" -name slang.h -print -quit)
+          lib=$(find "${{ github.workspace }}/vulkan-sdk" -name 'libslang.so*' -print -quit)
+          test -n "$inc" || { echo "::error::slang.h not found in the SDK"; exit 1; }
+          test -n "$lib" || { echo "::error::libslang.so not found in the SDK"; exit 1; }
+          echo "SLANG_INCLUDE_DIR=$(dirname "$inc")" >> "$GITHUB_ENV"
+          echo "SLANG_LIB_DIR=$(dirname "$lib")" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$(dirname "$lib")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          echo "found slang.h at $inc"
+          echo "found libslang at $lib"
+
       - uses: Swatinem/rust-cache@v2
 
       # Denies rustc lints (the crate is at zero) but allows clippy's own style
@@ -56,10 +69,20 @@ jobs:
       - run: cargo test
 
   # Everything that actually executes the renderer, on hardware we own.
+  #
+  # Gated on the GPU_RUNNER repository variable, which does not exist yet:
+  # `vars.GPU_RUNNER` is then the empty string and the job is *skipped*. Without
+  # this gate the job queues forever waiting for a runner that isn't registered,
+  # which leaves every run permanently "in progress" and blocks log downloads.
+  # To switch it on once a self-hosted runner exists: Settings → Secrets and
+  # variables → Actions → Variables → new repository variable GPU_RUNNER = true.
+  # No workflow edit needed. Until then, run scripts/gpu-check.ps1 by hand.
   gpu:
     # A self-hosted runner reachable from a fork PR is remote code execution on a
     # personal machine. Same-repo events only.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      vars.GPU_RUNNER == 'true' &&
+      (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, windows, gpu]
     defaults:
       run:
@@ -72,7 +95,7 @@ jobs:
       SUNRAY_ENABLE_VALIDATION_LAYER: "1"
       SUNRAY_SERIALIZE_FRAMES: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # --include-ignored picks up transient_aliasing_debug and
       # compile_runs_passes_in_topo_order. Release so every step below reuses it.
