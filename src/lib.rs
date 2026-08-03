@@ -20,7 +20,10 @@ use crate::render_graph::graph::{ExportedTemporalResource, RenderGraph};
 use crate::render_graph::pass_builder::{
     ComputeRenderPassBuilder, ComputeShaders, PassCommonDataBuilder, RayTracingShaders, RaytracingRenderPassBuilder, ShaderSource,
 };
-use crate::utils::{env_var_as_bool, ENABLE_GPUAV, ENABLE_NSIGHT, ENABLE_NVIDIA_AFTERMATH, ENABLE_VALIDATION_LAYER, IS_DEBUG_BUILD, SERIALIZE_FRAMES};
+use crate::utils::{
+    ENABLE_GPUAV, ENABLE_NSIGHT, ENABLE_NVIDIA_AFTERMATH, ENABLE_VALIDATION_LAYER, IS_DEBUG_BUILD, SERIALIZE_FRAMES,
+    env_var_as_bool,
+};
 use crate::vulkan_abstraction::image::swapchain::{Surface, Swapchain};
 use crate::vulkan_abstraction::swapchain::{SwapchainData, SwapchainFrame};
 use crate::vulkan_abstraction::{Buffer, HostAccessibleBuffer, PostprocessPushConstant, Reservoir, ReservoirGI};
@@ -1936,8 +1939,6 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         &self.core
     }
 }
-
-
 
 impl<K: Hash + Eq + Copy + 'static> Drop for Renderer<K> {
     fn drop(&mut self) {

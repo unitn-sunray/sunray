@@ -1,0 +1,117 @@
+name: CI
+
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Compile-time verification only. A hosted runner can build this crate but can
+  # never run it: the device requires VK_EXT_descriptor_heap and
+  # VK_KHR_shader_untyped_pointers (see src/vulkan_abstraction/core/mod.rs), which
+  # neither lavapipe nor SwiftShader implement. Execution happens in `gpu` below.
+  check:
+    runs-on: ubuntu-latest
+    env:
+      # build.rs needs Slang, ash's `linked` feature needs the Vulkan loader, and
+      # shaderc-sys needs libshaderc — the LunarG SDK ships all three. Variable
+      # names mirror shell.nix, which is the known-good local reference.
+      SLANG_INCLUDE_DIR: ${{ github.workspace }}/vulkan-sdk/include
+      SLANG_LIB_DIR: ${{ github.workspace }}/vulkan-sdk/lib
+      SHADERC_LIB_DIR: ${{ github.workspace }}/vulkan-sdk/lib
+      LD_LIBRARY_PATH: ${{ github.workspace }}/vulkan-sdk/lib
+    steps:
+      - uses: actions/checkout@v4
+
+      # Needs no build, so formatting breakage reports in seconds rather than
+      # after the whole native-dep dance below.
+      - run: cargo fmt --all --check
+
+      # libclang: bindgen, for shader-slang-sys.
+      # X11/wayland: winit, so --all-targets can build the `window` example.
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev libwayland-dev libxkbcommon-dev \
+            libxcursor-dev libxrandr-dev libxi-dev
+
+      # Pinned, never `latest`: build.rs hard-panics if the bundled Slang predates
+      # PR #10177 (Feb 2026) and so doesn't know `spvDescriptorHeapEXT`.
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: 1.4.357.0
+          destination: ${{ github.workspace }}/vulkan-sdk
+          cache: true
+
+      - uses: Swatinem/rust-cache@v2
+
+      # No `-D warnings` yet: the lib currently emits ~25 rustc warnings (dead
+      # code, private-interface, one deprecated field), so denying would make this
+      # job red on day one. Add `-- -D warnings` once that backlog is cleared.
+      - run: cargo clippy --all-targets
+
+      # 9 device-free tests; the two Core::new ones are #[ignore]d and run in `gpu`.
+      - run: cargo test
+
+  # Everything that actually executes the renderer, on hardware we own.
+  gpu:
+    # A self-hosted runner reachable from a fork PR is remote code execution on a
+    # personal machine. Same-repo events only.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, windows, gpu]
+    defaults:
+      run:
+        shell: pwsh
+    # Set explicitly rather than inherited from .cargo/config.toml's [env]: the
+    # smoke tests below launch the built .exe directly, which cargo never sees.
+    # Without validation on, the release window example hits the known async-UAF
+    # driver crash documented at src/lib.rs:1168.
+    env:
+      SUNRAY_ENABLE_VALIDATION_LAYER: "1"
+      SUNRAY_SERIALIZE_FRAMES: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # --include-ignored picks up transient_aliasing_debug and
+      # compile_runs_passes_in_topo_order. Release so every step below reuses it.
+      - name: Test (incl. GPU)
+        run: cargo test --release -- --include-ignored
+
+      # `cargo png` is the release alias from .cargo/config.toml.
+      - name: Render offscreen
+        run: cargo png
+
+      - name: Compare against baseline
+        run: |
+          $want = (Get-Content examples/png/render.sha256).Trim()
+          $got  = (Get-FileHash examples/png/render.png -Algorithm SHA256).Hash
+          if ($got -ne $want) {
+            throw "render changed: want=$want got=$got (re-baseline if intended)"
+          }
+          "pixel-identical ($got)"
+
+      # Liveness, not correctness: a healthy window never exits on its own, so
+      # exiting inside 10s is the failure signal. It covers both a panic and the
+      # graceful path, since handle_srresult exits the event loop on any
+      # non-OUT_OF_DATE error. -WorkingDirectory matters — the example resolves
+      # examples/log4rs.yaml and the .glb against CWD.
+      # Needs a logged-in interactive runner session: this opens a real window.
+      - name: Smoke-test window example (10s)
+        run: |
+          cargo build --release --example window
+          $p = Start-Process -FilePath "target\release\examples\window.exe" -WorkingDirectory $PWD -PassThru
+          if ($p.WaitForExit(10000)) { throw "window exited early (code $($p.ExitCode))" }
+          $p.Kill(); $p.WaitForExit()
+          "window survived 10s"
+
+      # Optional: reports in the UI but never fails the pipeline, so a moving
+      # bevy integration can't block unrelated work.
+      - name: Smoke-test bevy example (10s)
+        continue-on-error: true
+        run: |
+          cargo build --release --features bevy --example bevy_app
+          $p = Start-Process -FilePath "target\release\examples\bevy_app.exe" -WorkingDirectory $PWD -PassThru
+          if ($p.WaitForExit(10000)) { throw "bevy_app exited early (code $($p.ExitCode))" }
+          $p.Kill(); $p.WaitForExit()
+          "bevy_app survived 10s"

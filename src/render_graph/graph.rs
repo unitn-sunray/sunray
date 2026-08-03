@@ -2130,6 +2130,7 @@ mod tests {
     ///   res 4: 1024-byte buffer,lifetime [4,5]  → reuses earliest free slot
     ///   res 5: sampler                          (not aliased)
     #[test]
+    #[ignore = "needs an RT-capable GPU (Core::new); run with --include-ignored"]
     fn transient_aliasing_debug() {
         let core = Rc::new(Core::new(false, false, vk::Format::R8G8B8A8_UNORM).expect("Core::new failed"));
 
@@ -2198,6 +2199,7 @@ mod tests {
     /// command buffer that's been begin-recorded, and (c) compile returns a
     /// `RenderGraph<Built>` carrying a real `CmdBuffer`.
     #[test]
+    #[ignore = "needs an RT-capable GPU (Core::new); run with --include-ignored"]
     fn compile_runs_passes_in_topo_order() {
         use crate::render_graph::pass_builder::{ComputeRenderPassBuilder, PassCommonDataBuilder};
         use std::cell::RefCell;

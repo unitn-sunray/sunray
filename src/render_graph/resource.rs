@@ -5,7 +5,6 @@ use crate::vulkan_abstraction::image::ImageDesc;
 use crate::vulkan_abstraction::image::sampler::SamplerDesc;
 use crate::vulkan_abstraction::{AccelerationStructure, Buffer, Image, RawBuffer, Sampler};
 use enum_as_inner::EnumAsInner;
-use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use vk_sync_fork as vk_sync;

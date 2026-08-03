@@ -34,9 +34,9 @@ fn render_to_file(image_buf: &[u8], image_extent: (u32, u32), path: &str, format
 
     match result {
         Ok(_) => println!("You can find your render here: {}", path),
-        Err(e) => {
-            log::error!("{e:?}")
-        }
+        // Panics rather than logs: CI gates on this example's exit code, and a PNG
+        // that failed to save must not report success.
+        Err(e) => panic!("while saving '{path}': {e:?}"),
     }
 }
 
@@ -60,11 +60,9 @@ fn render_and_save() -> SrResult<()> {
     Ok(())
 }
 
-fn main() {
+// Returns the error so a failed render exits nonzero — CI gates on it.
+fn main() -> SrResult<()> {
     init_logging();
 
-    match render_and_save() {
-        Ok(()) => {}
-        Err(e) => log::error!("Sunray error: {e}"),
-    }
+    render_and_save().inspect_err(|e| log::error!("Sunray error: {e}"))
 }

@@ -37,7 +37,6 @@ pub(crate) const DEFAULT_GRAPH_DUMP_DIR: &str = "debug";
 
 pub(crate) const IS_DEBUG_BUILD: bool = cfg!(debug_assertions);
 
-
 /// Parse an env var as a boolean. Accepts `1`/`0`, `true`/`false`, `on`/`off`
 /// (case-insensitive). `None` if unset, empty, or unrecognized — callers then
 /// use their own default rather than silently reading an off.

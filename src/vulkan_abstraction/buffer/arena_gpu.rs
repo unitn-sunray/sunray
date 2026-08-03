@@ -8,7 +8,7 @@ use crate::MAX_FRAMES_IN_FLIGHT;
 use crate::error::*;
 use crate::render_graph::Handle;
 use crate::vulkan_abstraction;
-use crate::vulkan_abstraction::{BufferDesc, RawBuffer};
+use crate::vulkan_abstraction::RawBuffer;
 
 use super::{Buffer, GpuOnlyBuffer, HostAccessibleBuffer, StagingBuffer};
 

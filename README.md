@@ -47,6 +47,40 @@ SUNRAY_SHADER_DEBUG=1 cargo build
 | `nvidia-aftermath` | Links the NVIDIA Aftermath SDK for the user-space crash-dump handler. Without it, `SUNRAY_ENABLE_NVIDIA_AFTERMATH` still wires up the Vulkan-side diagnostics/checkpoint extensions |
 | `bevy` | Enables `sunray::bevy_integration` and the `bevy_app` example — see [docs/bevy_integration.md](docs/bevy_integration.md) |
 
+## CI
+
+`.github/workflows/ci.yml` runs two jobs on every push and PR.
+
+**`check`** (GitHub-hosted, Ubuntu) — `cargo fmt --all --check`, `cargo clippy
+--all-targets`, `cargo test`. Compile-time only: a hosted runner can build the crate
+but can never run it, because the device requires `VK_EXT_descriptor_heap` and
+`VK_KHR_shader_untyped_pointers`, which neither lavapipe nor SwiftShader implement.
+Slang, the Vulkan loader and shaderc all come from a pinned LunarG SDK — pinned, not
+`latest`, because `build.rs` panics if the bundled Slang predates the
+`spvDescriptorHeapEXT` capability.
+
+**`gpu`** (self-hosted, this project's Windows box) — everything that actually
+executes: `cargo test --release -- --include-ignored`, the offscreen `cargo png` render
+compared byte-for-byte against a baseline, and 10-second liveness smoke tests of the
+`window` and `bevy_app` examples. The runner must run interactively in a logged-in
+session; a Windows service can neither reach the GPU nor open a window. The job is
+gated to same-repo events, since a self-hosted runner reachable from a fork PR is
+remote code execution.
+
+The two render-graph tests that construct a `Core` are marked `#[ignore]`, so a plain
+`cargo test` stays GPU-free; `--include-ignored` runs the full set.
+
+### Re-baselining the render
+
+`examples/png/render.sha256` pins the expected output of `cargo png`. After an
+intentional visual change — or a driver update, which also shifts the hash — regenerate
+it and commit:
+
+```powershell
+cargo png
+(Get-FileHash examples/png/render.png -Algorithm SHA256).Hash | Set-Content -Encoding ascii examples/png/render.sha256
+```
+
 ## Contribution
 
 If you wish to contribute to the project you may check our issues, or if you found a bug or missing feature feel free to create one. 

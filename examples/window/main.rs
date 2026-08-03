@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::io;
+use std::io::IsTerminal;
 use std::io::Read;
 
 use ash::vk;
@@ -378,12 +379,18 @@ impl ApplicationHandler for App {
 fn main() {
     log4rs::config::init_file("examples/log4rs.yaml", log4rs::config::Deserializers::new()).unwrap();
 
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        default_hook(info);
-        println!("\nPress Enter to exit...");
-        let _ = io::stdin().read(&mut [0u8]);
-    }));
+    // Keep the console open after a panic so the backtrace is readable — but only
+    // when there's a human at a terminal. Under CI stdin is not a tty and this hook
+    // would block forever, turning a crash into a hang (which the liveness smoke
+    // test would then read as "still running" == pass).
+    if io::stdin().is_terminal() {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default_hook(info);
+            println!("\nPress Enter to exit...");
+            let _ = io::stdin().read(&mut [0u8]);
+        }));
+    }
 
     if cfg!(debug_assertions) {
         log::set_max_level(log::LevelFilter::Debug);
