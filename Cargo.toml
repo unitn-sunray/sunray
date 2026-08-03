@@ -23,6 +23,9 @@ rand = "0.10.1"
 derive_builder = "0.20.2"
 enum-as-inner = "0.7.0"
 shader-slang = "0.1.0"
+image = "0.25.8"
+petgraph = "0.8.3"
+
 # Optional: enables the NVIDIA Aftermath user-space crash-dump handler.
 # Off by default — pulls in the Aftermath SDK runtime (the build script downloads
 # it via sysreq) which isn't needed for normal use. Even without the feature
@@ -30,7 +33,6 @@ shader-slang = "0.1.0"
 # device-diagnostics-config + checkpoint extensions, which alone already help
 # localize a faulting dispatch.
 aftermath-rs = { git = "https://github.com/MatteoBallardin/aftermath-rs.git", optional = true }
-petgraph = "0.8.3"
 
 # --- Bevy integration (optional, gated behind the `bevy` feature) -----------
 # Registry deps (0.19.0). We depend on the individual crates rather than
@@ -57,6 +59,7 @@ bevy_color = { version = "0.19.0", optional = true }
 
 egui = { version = "0.35.0", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
+
 
 [features]
 default = [ ]
