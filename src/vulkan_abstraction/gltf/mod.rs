@@ -3,7 +3,7 @@ use crate::{
     vulkan_abstraction,
 };
 use std::path::Path;
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, sync::Arc};
 
 use nalgebra as na;
 
@@ -48,14 +48,14 @@ macro_rules! insert_tex_coords {
 pub type PrimitiveDataMap = HashMap<vulkan_abstraction::gltf::PrimitiveUniqueKey, vulkan_abstraction::gltf::PrimitiveData>;
 
 pub struct Gltf {
-    core: Rc<vulkan_abstraction::Core>,
+    core: Arc<vulkan_abstraction::Core>,
     document: gltf::Document,
     buffers: Vec<gltf::buffer::Data>,
     images: Vec<gltf::image::Data>,
 }
 
 impl Gltf {
-    pub fn new(core: Rc<vulkan_abstraction::Core>, path: impl AsRef<Path>) -> SrResult<Self> {
+    pub fn new(core: Arc<vulkan_abstraction::Core>, path: impl AsRef<Path>) -> SrResult<Self> {
         let (document, buffers, images) = gltf::import(path)?;
 
         Ok(Self {
@@ -330,7 +330,7 @@ impl Gltf {
                         (0..vertices.len() as u32 / 3).collect::<Vec<_>>()
                     };
 
-                    vulkan_abstraction::IndexBuffer::new_for_blas_from_data(Rc::clone(&self.core), &indices)?
+                    vulkan_abstraction::IndexBuffer::new_for_blas_from_data(Arc::clone(&self.core), &indices)?
                 };
 
                 // This could also be done with zip, but the code would be equally long and with a lot of nested tuples
@@ -341,7 +341,7 @@ impl Gltf {
                 insert_tex_coords!(reader, vertices, tex_coords.3, occlusion_tex);
                 insert_tex_coords!(reader, vertices, tex_coords.4, emissive_tex);
 
-                let vertex_buffer = vulkan_abstraction::VertexBuffer::new_for_blas_from_data(Rc::clone(&self.core), &vertices)?;
+                let vertex_buffer = vulkan_abstraction::VertexBuffer::new_for_blas_from_data(Arc::clone(&self.core), &vertices)?;
 
                 let primitive_data = vulkan_abstraction::gltf::PrimitiveData {
                     vertex_buffer,

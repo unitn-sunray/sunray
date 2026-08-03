@@ -58,12 +58,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Denies rustc lints (the crate is at zero) but allows clippy's own style
-      # lints, of which there are still 49 — mostly `Arc` that isn't Send+Sync,
-      # which is inherent to the Rc-based design, plus too_many_arguments and
-      # complex types.TODO Drop `-A clippy::all` once those are addressed.
+      # Both rustc and clippy lints are at zero; keep them there.
       # Flags after `--` apply to this crate only, not to dependencies.
-      - run: cargo clippy --all-targets -- -D warnings -A clippy::all
+      - run: cargo clippy --all-targets -- -D warnings
 
       # 9 device-free tests; the two Core::new ones are #[ignore]d and run in `gpu`.
       - run: cargo test
@@ -115,19 +112,27 @@ jobs:
           }
           "pixel-identical ($got)"
 
-      # Liveness, not correctness: a healthy window never exits on its own, so
-      # exiting inside 10s is the failure signal. It covers both a panic and the
-      # graceful path, since handle_srresult exits the event loop on any
-      # non-OUT_OF_DATE error. -WorkingDirectory matters — the example resolves
-      # examples/log4rs.yaml and the .glb against CWD.
+      # Two conditions, because surviving is not the same as working: it must not
+      # exit inside 10s (a healthy window never exits on its own, so an early exit
+      # is a panic or the graceful path — handle_srresult exits the event loop on
+      # any non-OUT_OF_DATE error), AND it must print the once-a-second
+      # "[heartbeat]" line. A deadlocked renderer never exits either, so the
+      # liveness half alone reports a hung binary as green.
+      # -WorkingDirectory matters — the example resolves examples/log4rs.yaml and
+      # the .glb against CWD.
       # Needs a logged-in interactive runner session: this opens a real window.
       - name: Smoke-test window example (10s)
         run: |
           cargo build --release --example window
-          $p = Start-Process -FilePath "target\release\examples\window.exe" -WorkingDirectory $PWD -PassThru
+          $out = New-TemporaryFile
+          $p = Start-Process -FilePath "target\release\examples\window.exe" -WorkingDirectory $PWD -PassThru -RedirectStandardOutput $out
           if ($p.WaitForExit(10000)) { throw "window exited early (code $($p.ExitCode))" }
           $p.Kill(); $p.WaitForExit()
-          "window survived 10s"
+          $beats = @(Select-String -Path $out -Pattern '[heartbeat]' -SimpleMatch)
+          if ($beats.Count -lt 2) {
+            throw "window stayed alive but produced $($beats.Count) heartbeat(s) in 10s — running but not rendering"
+          }
+          "window rendered for 10s ($($beats.Count) heartbeats)"
 
       # Optional: reports in the UI but never fails the pipeline, so a moving
       # bevy integration can't block unrelated work.

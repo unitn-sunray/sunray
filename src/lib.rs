@@ -32,7 +32,7 @@ use render_graph::resource::Handle;
 use std::hash::Hash;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::{collections::HashMap, rc::Rc, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 use vk_sync_fork as vk_sync;
 use vulkan_abstraction::buffer::BufferDesc;
 use vulkan_abstraction::image::ImageDesc;
@@ -93,7 +93,25 @@ pub enum FrameOutput<'a> {
 
 pub type CreateSurfaceFn = dyn Fn(&ash::Entry, &ash::Instance) -> SrResult<vk::SurfaceKHR>;
 
-pub struct Renderer<K: Hash + Eq + Copy + 'static = ResourceKey> {
+/// One scene instance: the BLAS key plus every world transform it is drawn at.
+pub type SceneInstance<K> = (K, Vec<vk::TransformMatrixKHR>);
+
+/// What `load_scene` / `load_gltf` hand back: the asset group index (for
+/// [`Renderer::unload_scene`]) and the scene's instances.
+pub type LoadedSceneHandles<K> = (u64, Vec<SceneInstance<K>>);
+
+/// Frame-tagged one-shot callbacks, ordered; `u64` is the absolute frame each
+/// is due on.
+type StartOfFrameCallbacks = Vec<(u64, Box<dyn FnOnce() + Send>)>;
+type EndOfFrameCallbacks<K> = Vec<(u64, Box<dyn FnOnce(&mut Renderer<K>) + Send>)>;
+/// Persistent (`FnMut`) callbacks invoked on every `resize`.
+type ResizeCallbacks = Vec<Box<dyn FnMut((u32, u32)) + Send>>;
+
+/// Hook run after the graph has recorded but before present — see
+/// [`Renderer::render_to_swapchain_with`].
+pub type FinalizeFn<'a> = &'a mut dyn FnMut(&SwapchainFrame) -> SrResult<()>;
+
+pub struct Renderer<K: Hash + Eq + Copy + Send + 'static = ResourceKey> {
     /// The one intermediate image the renderer still owns: the post-process
     /// output. The graph writes it (imported), then blits it into the frame's
     /// output target. A single backing suffices — the graph serializes frame N's
@@ -140,7 +158,7 @@ pub struct Renderer<K: Hash + Eq + Copy + 'static = ResourceKey> {
     blue_noise_image: vulkan_abstraction::Image,
     blue_noise_sampler: vulkan_abstraction::Sampler,
 
-    core: Rc<vulkan_abstraction::Core>,
+    core: Arc<vulkan_abstraction::Core>,
 
     //TODO finni all of this params are pipeline-specific temporal (cross-frame) stuff. They now
     // live as temporal resources owned by the render graph (created once, re-registered each
@@ -196,19 +214,19 @@ pub struct Renderer<K: Hash + Eq + Copy + 'static = ResourceKey> {
     frame_watcher_shutdown: Arc<AtomicBool>,
     /// Thread (spawned at construction) that waits the frame timeline and
     /// publishes `completed_frame`. The callbacks themselves run on the render
-    /// thread (they capture `Rc`-based GPU resources, which are `!Send`) —
+    /// thread (they capture `Arc`-based GPU resources, which are `!Send`) —
     /// `render` drains the ones whose frame the watcher reported complete.
     frame_watcher: Option<std::thread::JoinHandle<()>>,
 
     //TODO these would love #![feature(unboxed_closures)]
     //these are ordered,the u64 is the absolute frame on which to execute and the actual callback
-    start_of_frame_callbacks: Vec<(u64, Box<dyn FnOnce()>)>,
+    start_of_frame_callbacks: StartOfFrameCallbacks,
     /// Persistent (FnMut) callbacks invoked on every `resize`.
-    resize_callbacks: Vec<Box<dyn FnMut((u32, u32))>>,
+    resize_callbacks: ResizeCallbacks,
     /// Run on the render thread once the tagged frame has *completed on the
     /// GPU* (per `completed_frame`). The per-frame CpuToGpu buffers `render`
     /// creates are deallocated through here.
-    end_of_frame_callbacks: Vec<(u64, Box<dyn FnOnce(&mut Renderer<K>)>)>,
+    end_of_frame_callbacks: EndOfFrameCallbacks<K>,
 }
 
 /// Per-frame GPU inputs of the unified graph that live in frame-local buffers
@@ -222,7 +240,7 @@ struct FrameGpuData {
 }
 // `K: 'static` propagated from `ResourceManager` (its deferred frame work is
 // stored as boxed callbacks).
-impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
+impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
     pub fn new(image_extent: (u32, u32), image_format: vk::Format) -> SrResult<Self> {
         Self::new_impl(image_extent, image_format, &[], None)
     }
@@ -269,13 +287,13 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
             create_surface,
         )?;
 
-        let core = Rc::new(core);
+        let core = Arc::new(core);
 
         let window_extent = image_extent;
         let image_extent = utils::tuple_to_extent3d(image_extent);
 
         //must be filled by loading a scene
-        let resource_manager = vulkan_abstraction::ResourceManager::new_empty(Rc::clone(&core))?;
+        let resource_manager = vulkan_abstraction::ResourceManager::new_empty(Arc::clone(&core))?;
 
         let ray_gen_ris_spirv: &'static [u8] = include_bytes_align_as!(u32, concat!(env!("OUT_DIR"), "/ray_gen_ris.spirv"));
         let ray_gen_final_spirv: &'static [u8] = include_bytes_align_as!(u32, concat!(env!("OUT_DIR"), "/ray_gen_final.spirv"));
@@ -298,22 +316,24 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         let blue_noise_data = blue_noise_img.into_raw();
 
         let blue_noise_image = vulkan_abstraction::Image::new_from_data(
-            Rc::clone(&core),
+            Arc::clone(&core),
             blue_noise_data,
-            vk::Extent3D {
-                width: noise_width,
-                height: noise_height,
-                depth: 1,
+            &ImageDesc {
+                extent: vk::Extent3D {
+                    width: noise_width,
+                    height: noise_height,
+                    depth: 1,
+                },
+                format: vk::Format::R8G8B8A8_UNORM,
+                tiling: vk::ImageTiling::OPTIMAL,
+                location: gpu_allocator::MemoryLocation::GpuOnly,
+                usage: vk::ImageUsageFlags::SAMPLED,
+                name: "blue noise texture",
             },
-            vk::Format::R8G8B8A8_UNORM,
-            vk::ImageTiling::OPTIMAL,
-            gpu_allocator::MemoryLocation::GpuOnly,
-            vk::ImageUsageFlags::SAMPLED,
-            "blue noise texture",
         )?;
 
         let blue_noise_sampler = vulkan_abstraction::Sampler::new(
-            Rc::clone(&core),
+            Arc::clone(&core),
             vk::Filter::NEAREST,
             vk::Filter::NEAREST,
             vk::SamplerAddressMode::REPEAT,
@@ -322,11 +342,11 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
             vk::SamplerMipmapMode::NEAREST,
         )?;
 
-        let mut render_graph = RenderGraph::new(Rc::clone(&core))?;
+        let mut render_graph = RenderGraph::new(Arc::clone(&core))?;
 
         // Per-slot camera-matrices UBOs (stable device addresses; see field doc).
         let matrices_pool = (0..MAX_FRAMES_IN_FLIGHT)
-            .map(|_| vulkan_abstraction::UniformBuffer::<CameraMatrices>::new(Rc::clone(&core), 1))
+            .map(|_| vulkan_abstraction::UniformBuffer::<CameraMatrices>::new(Arc::clone(&core), 1))
             .collect::<SrResult<Vec<_>>>()?;
 
         // Temporal (cross-frame) resources: the graph owns the backing memory and
@@ -352,7 +372,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
 
         // Watcher thread: waits the timeline value-by-value and publishes the
         // last completed frame. It only *observes* — the end-of-frame callbacks
-        // run on the render thread because they capture `Rc`-based (!Send) GPU
+        // run on the render thread because they capture `Arc`-based (!Send) GPU
         // resources. `ash::Device` is Send + Sync, so the raw waits are fine here.
         let frame_watcher = {
             let device = core.device().inner().clone();
@@ -457,11 +477,11 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
     /// it into the frame's output target). `R8G8B8A8_UNORM` storage image, sized to
     /// the render extent — recreated on resize.
     fn create_postprocess_result_image(
-        core: &Rc<vulkan_abstraction::Core>,
+        core: &Arc<vulkan_abstraction::Core>,
         extent: vk::Extent3D,
     ) -> SrResult<Arc<vulkan_abstraction::Image>> {
         let image = vulkan_abstraction::Image::new(
-            Rc::clone(core),
+            Arc::clone(core),
             extent,
             vk::Format::R8G8B8A8_UNORM,
             vk::ImageTiling::OPTIMAL,
@@ -475,7 +495,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         // created-resource init transition doesn't cover it: discard-init to GENERAL.
         {
             let device = core.device().inner();
-            let mut setup = vulkan_abstraction::CmdBuffer::new(Rc::clone(core))?;
+            let mut setup = vulkan_abstraction::CmdBuffer::new(Arc::clone(core))?;
             unsafe {
                 let begin = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
                 device.begin_command_buffer(setup.inner(), &begin)?;
@@ -556,7 +576,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
             .collect();
 
         let device = self.core.device().inner();
-        let mut setup_cmd_buf = vulkan_abstraction::CmdBuffer::new(Rc::clone(&self.core))?;
+        let mut setup_cmd_buf = vulkan_abstraction::CmdBuffer::new(Arc::clone(&self.core))?;
         unsafe {
             let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             device.begin_command_buffer(setup_cmd_buf.inner(), &begin_info)?;
@@ -597,8 +617,8 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
 
     /// Schedule `callback` to run on the CPU at the start of the next frame
     /// (before any per-frame upload).
-    pub fn add_start_of_frame_callback(&mut self, callback: impl FnOnce() + 'static) {
-        let next_frame = *self.core.absolute_frame_count.borrow() as u64 + 1;
+    pub fn add_start_of_frame_callback(&mut self, callback: impl FnOnce() + Send + 'static) {
+        let next_frame = self.core.absolute_frame_count() as u64 + 1;
         self.start_of_frame_callbacks.push((next_frame, Box::new(callback)));
     }
 
@@ -606,13 +626,13 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
     /// on the GPU* (per the frame timeline). This is the deferred-deallocation
     /// hook: dropping a GPU resource inside the callback is safe because the
     /// frame that used it is provably done.
-    pub fn add_end_of_frame_callback(&mut self, callback: impl FnOnce(&mut Renderer<K>) + 'static) {
-        let next_frame = *self.core.absolute_frame_count.borrow() as u64 + 1;
+    pub fn add_end_of_frame_callback(&mut self, callback: impl FnOnce(&mut Renderer<K>) + Send + 'static) {
+        let next_frame = self.core.absolute_frame_count() as u64 + 1;
         self.end_of_frame_callbacks.push((next_frame, Box::new(callback)));
     }
 
     /// Register a persistent callback invoked on every [`Self::resize`].
-    pub fn add_resize_callback(&mut self, callback: impl FnMut((u32, u32)) + 'static) {
+    pub fn add_resize_callback(&mut self, callback: impl FnMut((u32, u32)) + Send + 'static) {
         self.resize_callbacks.push(Box::new(callback));
     }
 
@@ -736,11 +756,11 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
 
     /// Load a glTF file's default scene. See [`Self::load_scene`] for the
     /// return contract.
-    pub fn load_gltf(&mut self, path: impl AsRef<Path>) -> SrResult<(u64, Vec<(K, Vec<vk::TransformMatrixKHR>)>)>
+    pub fn load_gltf(&mut self, path: impl AsRef<Path>) -> SrResult<LoadedSceneHandles<K>>
     where
         K: From<ResourceKey>,
     {
-        let gltf = vulkan_abstraction::gltf::Gltf::new(Rc::clone(&self.core), path)?;
+        let gltf = vulkan_abstraction::gltf::Gltf::new(Arc::clone(&self.core), path)?;
         let (default_scene, scene_data) = gltf.create_default_scene()?;
         self.load_scene(&default_scene, scene_data)
     }
@@ -751,7 +771,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
     /// `(blas key, world transforms)` vector. The instance list is *not*
     /// retained anywhere — the caller owns it, mutates it, and passes it to
     /// [`Self::render`] / [`Self::render_to_swapchain`] every frame.
-    pub fn load_scene(&mut self, scene: &Scene, scene_data: SceneData) -> SrResult<(u64, Vec<(K, Vec<vk::TransformMatrixKHR>)>)>
+    pub fn load_scene(&mut self, scene: &Scene, scene_data: SceneData) -> SrResult<LoadedSceneHandles<K>>
     where
         K: From<ResourceKey>,
     {
@@ -877,14 +897,14 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
             Vec::new()
         };
 
-        let vertex_buffer = vulkan_abstraction::VertexBuffer::new_for_blas_from_data(Rc::clone(&self.core), vertices)?;
-        let index_buffer = vulkan_abstraction::IndexBuffer::new_for_blas_from_data(Rc::clone(&self.core), indices)?;
+        let vertex_buffer = vulkan_abstraction::VertexBuffer::new_for_blas_from_data(Arc::clone(&self.core), vertices)?;
+        let index_buffer = vulkan_abstraction::IndexBuffer::new_for_blas_from_data(Arc::clone(&self.core), indices)?;
         // Deferred build: the BLAS resource (and its device address) exists now, so
         // instances can reference it immediately, but the actual
         // `vkCmdBuildAccelerationStructures` is recorded into the next frame's render
         // graph by `ResourceManager::queue_blas_builds`. No GPU wait needed to add it.
         let (blas, build_job) = vulkan_abstraction::Blas::new_deferred(
-            Rc::clone(&self.core),
+            Arc::clone(&self.core),
             vertex_buffer,
             index_buffer,
             vulkan_abstraction::BuildType::Static,
@@ -917,7 +937,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
     /// as an instance from now on.
     pub fn unload_mesh(&mut self, key: &K) -> SrResult<()> {
         let key = *key;
-        let due = *self.core.absolute_frame_count.borrow() as u64 + 1 + MAX_FRAMES_IN_FLIGHT as u64;
+        let due = self.core.absolute_frame_count() as u64 + 1 + MAX_FRAMES_IN_FLIGHT as u64;
         self.end_of_frame_callbacks.push((
             due,
             Box::new(move |renderer: &mut Renderer<K>| renderer.resource_manager.remove(&key)),
@@ -938,15 +958,10 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
     /// The graph itself blits the post-process result into `output`'s image (see
     /// [`RenderGraph::run_present`]); [`FrameOutput`] decides the target's final
     /// layout (`PRESENT_SRC` vs `GENERAL`) and who signals present.
-    pub fn render(
-        &mut self,
-        camera: &Camera,
-        instances: &[(K, Vec<vk::TransformMatrixKHR>)],
-        output: FrameOutput<'_>,
-    ) -> SrResult<u64> {
+    pub fn render(&mut self, camera: &Camera, instances: &[SceneInstance<K>], output: FrameOutput<'_>) -> SrResult<u64> {
         // ── Start of frame: scheduled callbacks + deferred deallocation of the
         // per-frame resources of frames the timeline reported complete.
-        let upcoming_frame = *self.core.absolute_frame_count.borrow() as u64 + 1;
+        let upcoming_frame = self.core.absolute_frame_count() as u64 + 1;
 
         // Gate reuse of this frame's render-graph slot (its command buffer,
         // transient pool and retired passes) on the completion of the frame that
@@ -1037,7 +1052,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         }
 
         let instances_buffer = vulkan_abstraction::StagingBuffer::new_from_data(
-            Rc::clone(&self.core),
+            Arc::clone(&self.core),
             &as_instances,
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
@@ -1045,14 +1060,14 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
             "per-frame TLAS instances",
         )?;
         let transforms_buffer = vulkan_abstraction::StagingBuffer::new_from_data(
-            Rc::clone(&self.core),
+            Arc::clone(&self.core),
             &transforms,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             "per-frame instance transforms",
         )?;
         // Exactly sized: the shader reads num_lights via `GetDimensions`.
         let emissive_indirection_buffer = vulkan_abstraction::StagingBuffer::new_from_data(
-            Rc::clone(&self.core),
+            Arc::clone(&self.core),
             &emissive_entries,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             "per-frame emissive indirection",
@@ -1091,7 +1106,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
 
         // build_unified_graph advanced the absolute frame count: that's this
         // frame's number on the frame timeline.
-        let frame_value = *self.core.absolute_frame_count.borrow() as u64;
+        let frame_value = self.core.absolute_frame_count() as u64;
         debug_assert_eq!(frame_value, upcoming_frame);
 
         // The graph's command buffer blits the post-process result into the output
@@ -1185,7 +1200,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
     /// in-flight fence, acquires an image, calls [`Self::render`], transitions
     /// the image to `PRESENT_SRC` with the pre-recorded barrier, and presents.
     /// All per-frame inputs (camera + instances) come from the caller.
-    pub fn render_to_swapchain(&mut self, camera: &Camera, instances: &[(K, Vec<vk::TransformMatrixKHR>)]) -> SrResult<()> {
+    pub fn render_to_swapchain(&mut self, camera: &Camera, instances: &[SceneInstance<K>]) -> SrResult<()> {
         self.render_to_swapchain_with(camera, instances, None)
     }
 
@@ -1197,8 +1212,8 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
     pub fn render_to_swapchain_with(
         &mut self,
         camera: &Camera,
-        instances: &[(K, Vec<vk::TransformMatrixKHR>)],
-        finalize: Option<&mut dyn FnMut(&SwapchainFrame) -> SrResult<()>>,
+        instances: &[SceneInstance<K>],
+        finalize: Option<FinalizeFn<'_>>,
     ) -> SrResult<()> {
         let (frame_index, img_acquired_sem, img_rendered_frame) = {
             let sc = self
@@ -1244,7 +1259,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         // graph's `run_present` can blit into it — the swapchain is known to the
         // graph *only* here, at run.
         let swapchain_image = vulkan_abstraction::Image::from_swapchain_image(
-            Rc::clone(&self.core),
+            Arc::clone(&self.core),
             frame.image,
             vk::Extent3D {
                 width: frame.extent.width,
@@ -1397,7 +1412,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         // Advance the frame counters for the next frame (after snapshotting
         // `frame_count` for this one).
         self.relative_frame_count += 1;
-        *self.core.absolute_frame_count.borrow_mut() += 1;
+        self.core.advance_frame();
 
         let rg = &mut self.render_graph;
         rg.reset();
@@ -1430,7 +1445,7 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         // completion, so `run_due_end_of_frame_callbacks` fires these at the right
         // time. Pushed straight onto the field so the `rg` (= `&mut
         // self.render_graph`) borrow held here stays disjoint.
-        let frame = *self.core.absolute_frame_count.borrow() as u64;
+        let frame = self.core.absolute_frame_count() as u64;
         for (key, _) in built_blases {
             self.end_of_frame_callbacks.push((
                 frame,
@@ -1886,13 +1901,9 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         Ok(())
     }
 
-    pub fn render_to_host_memory(
-        &mut self,
-        camera: &Camera,
-        instances: &[(K, Vec<vk::TransformMatrixKHR>)],
-    ) -> SrResult<Vec<u8>> {
+    pub fn render_to_host_memory(&mut self, camera: &Camera, instances: &[SceneInstance<K>]) -> SrResult<Vec<u8>> {
         let mut dst_image = vulkan_abstraction::Image::new(
-            Rc::clone(&self.core),
+            Arc::clone(&self.core),
             self.image_extent,
             self.image_format,
             vk::ImageTiling::LINEAR,
@@ -1917,12 +1928,12 @@ impl<K: Hash + Eq + Copy + 'static> Renderer<K> {
         dst_image.get_raw_image_data_with_no_padding()
     }
 
-    pub fn core(&self) -> &Rc<vulkan_abstraction::Core> {
+    pub fn core(&self) -> &Arc<vulkan_abstraction::Core> {
         &self.core
     }
 }
 
-impl<K: Hash + Eq + Copy + 'static> Drop for Renderer<K> {
+impl<K: Hash + Eq + Copy + Send + 'static> Drop for Renderer<K> {
     fn drop(&mut self) {
         // Stop the frame watcher before any Vulkan object it touches (the
         // timeline semaphore, the device) can be destroyed by the field drops
@@ -1949,3 +1960,11 @@ impl<K: Hash + Eq + Copy + 'static> Drop for Renderer<K> {
         }
     }
 }
+
+// See the matching assertion on `Core`. `Renderer` is `Send` so it can be moved
+// onto a render thread; it is deliberately *not* `Sync` — sharing one across
+// threads means wrapping it in a `Mutex` at the call site.
+const _: fn() = || {
+    fn assert_send<T: Send + ?Sized>() {}
+    assert_send::<Renderer<ResourceKey>>();
+};

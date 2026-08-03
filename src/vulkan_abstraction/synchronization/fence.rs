@@ -3,7 +3,7 @@ use crate::{
     vulkan_abstraction,
 };
 use ash::vk;
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub fn wait_fence(device: &vulkan_abstraction::Device, fence: vk::Fence) -> SrResult<()> {
     if fence != vk::Fence::null() {
@@ -13,19 +13,19 @@ pub fn wait_fence(device: &vulkan_abstraction::Device, fence: vk::Fence) -> SrRe
 }
 
 pub struct Fence {
-    device: Rc<vulkan_abstraction::Device>,
+    device: Arc<vulkan_abstraction::Device>,
     handle: vk::Fence,
     fence_waited: bool,
 }
 
 impl Fence {
-    pub fn new_signaled(device: Rc<vulkan_abstraction::Device>) -> SrResult<Self> {
+    pub fn new_signaled(device: Arc<vulkan_abstraction::Device>) -> SrResult<Self> {
         Self::new(device, vk::FenceCreateFlags::SIGNALED)
     }
-    pub fn new_unsignaled(device: Rc<vulkan_abstraction::Device>) -> SrResult<Self> {
+    pub fn new_unsignaled(device: Arc<vulkan_abstraction::Device>) -> SrResult<Self> {
         Self::new(device, vk::FenceCreateFlags::empty())
     }
-    pub fn new(device: Rc<vulkan_abstraction::Device>, flags: vk::FenceCreateFlags) -> SrResult<Self> {
+    pub fn new(device: Arc<vulkan_abstraction::Device>, flags: vk::FenceCreateFlags) -> SrResult<Self> {
         let fence_info = vk::FenceCreateInfo::default().flags(flags);
 
         let handle = unsafe { device.inner().create_fence(&fence_info, None) }?;
@@ -62,6 +62,9 @@ impl Fence {
 
         Ok(())
     }
+    /// # Safety
+    /// The caller must not signal, reset or destroy the returned handle behind
+    /// this `Fence`'s back — it tracks its own signalled state for `Drop`.
     pub unsafe fn inner(&self) -> vk::Fence {
         self.handle
     }

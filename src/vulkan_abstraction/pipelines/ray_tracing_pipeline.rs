@@ -1,4 +1,4 @@
-use std::{ffi::CStr, rc::Rc};
+use std::{ffi::CStr, sync::Arc};
 
 use crate::error::SrResult;
 use crate::vulkan_abstraction;
@@ -70,7 +70,7 @@ pub struct RayTracingPipelineShaders {
 }
 
 pub struct RayTracingPipeline {
-    core: Rc<vulkan_abstraction::Core>,
+    core: Arc<vulkan_abstraction::Core>,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
 }
@@ -83,7 +83,7 @@ impl RayTracingPipeline {
     /// `cmd_push_data`. Caller supplies the four SPIR-V byte slices for
     /// ray-gen, miss, closest-hit, and any-hit.
     pub fn new_heap(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         ray_gen_spirv: &[u8],
         miss_spirv: &[u8],
         closest_hit_spirv: &[u8],
@@ -174,7 +174,7 @@ impl RayTracingPipeline {
 impl Pipeline for RayTracingPipeline {
     type Shaders = RayTracingPipelineShaders;
 
-    fn new(core: Rc<Core>, shaders: &Self::Shaders) -> SrResult<Self> {
+    fn new(core: Arc<Core>, shaders: &Self::Shaders) -> SrResult<Self> {
         Self::new_heap(core, &shaders.ray_gen, &shaders.miss, &shaders.closest_hit, &shaders.any_hit)
     }
 

@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use ash::vk;
 
@@ -22,14 +22,14 @@ struct SamplerParams {
 }
 
 pub struct Sampler {
-    core: Rc<vulkan_abstraction::Core>,
+    core: Arc<vulkan_abstraction::Core>,
     params: SamplerParams,
     slot: DescriptorSlot,
 }
 
 impl Sampler {
     /// Construct a sampler from a render-graph descriptor.
-    pub fn new_from_desc(core: Rc<vulkan_abstraction::Core>, desc: &SamplerDesc) -> SrResult<Self> {
+    pub fn new_from_desc(core: Arc<vulkan_abstraction::Core>, desc: &SamplerDesc) -> SrResult<Self> {
         Self::new(
             core,
             desc.min_filter,
@@ -42,7 +42,7 @@ impl Sampler {
     }
 
     pub fn new(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         min_filter: vk::Filter,
         mag_filter: vk::Filter,
         address_mode_u: vk::SamplerAddressMode,
@@ -61,7 +61,7 @@ impl Sampler {
         };
         let slot = core.descriptor_heap_mut().alloc_sampler_slot();
         core.descriptor_heap_mut()
-            .write_sampler(slot, &params.to_create_info())
+            .write_sampler(slot, &params.create_info())
             .expect("descriptor heap write_sampler failed");
 
         Ok(Self { core, params, slot })
@@ -74,7 +74,7 @@ impl Sampler {
 }
 
 impl SamplerParams {
-    fn to_create_info(&self) -> vk::SamplerCreateInfo<'static> {
+    fn create_info(&self) -> vk::SamplerCreateInfo<'static> {
         vk::SamplerCreateInfo::default()
             .flags(vk::SamplerCreateFlags::empty())
             .min_filter(self.min_filter)

@@ -1,5 +1,5 @@
 use crate::vulkan_abstraction::buffer::HostAccessibleBuffer;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::vulkan_abstraction::Buffer;
 use crate::{error::SrResult, vulkan_abstraction};
@@ -20,7 +20,7 @@ pub struct ShaderBindingTable {
 }
 
 impl ShaderBindingTable {
-    pub fn new(core: &Rc<vulkan_abstraction::Core>, rt_pipeline: &vulkan_abstraction::RayTracingPipeline) -> SrResult<Self> {
+    pub fn new(core: &Arc<vulkan_abstraction::Core>, rt_pipeline: &vulkan_abstraction::RayTracingPipeline) -> SrResult<Self> {
         // TODO: be more flexible and allow the user to provide more than 1 hit/miss shader
         const RAYGEN_COUNT: u32 = 1; //There is always one and only one raygen
         let miss_count = 1;
@@ -58,7 +58,7 @@ impl ShaderBindingTable {
         // Allocate a buffer for storing the SBT.
         let sbt_buffer_size = (raygen_region.size + miss_region.size + hit_region.size + callable_region.size) as vk::DeviceSize;
         let mut sbt_buffer: vulkan_abstraction::StagingBuffer<u8> = vulkan_abstraction::StagingBuffer::new(
-            Rc::clone(core),
+            Arc::clone(core),
             sbt_buffer_size,
             vk::BufferUsageFlags::TRANSFER_SRC
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS

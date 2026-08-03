@@ -1,4 +1,4 @@
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, sync::Arc};
 
 use crate::vulkan_abstraction::image::sampler::SamplerDesc;
 use crate::{error::SrResult, vulkan_abstraction};
@@ -49,7 +49,7 @@ impl Scene {
         &self.nodes
     }
 
-    pub fn load_into_gpu(&self, core: &Rc<vulkan_abstraction::Core>, mut scene_data: crate::SceneData) -> SrResult<LoadedScene> {
+    pub fn load_into_gpu(&self, core: &Arc<vulkan_abstraction::Core>, mut scene_data: crate::SceneData) -> SrResult<LoadedScene> {
         let mut blases = vec![];
         let mut instances = vec![];
 
@@ -96,7 +96,7 @@ impl Scene {
     fn explore_node(
         &self,
         node: &vulkan_abstraction::gltf::Node,
-        core: &Rc<vulkan_abstraction::Core>,
+        core: &Arc<vulkan_abstraction::Core>,
         blases: &mut Vec<LoadedBlas>,
         instances: &mut Vec<(usize, vk::TransformMatrixKHR)>,
         primitives_blas_index: &mut HashMap<vulkan_abstraction::gltf::PrimitiveUniqueKey, usize>,
@@ -169,24 +169,26 @@ impl Scene {
 }
 
 fn to_vk_image(
-    core: &Rc<vulkan_abstraction::Core>,
+    core: &Arc<vulkan_abstraction::Core>,
     image: vulkan_abstraction::gltf::Image,
 ) -> SrResult<vulkan_abstraction::Image> {
     let format = vk::Format::from_gltf(image.format);
 
     let image = vulkan_abstraction::Image::new_from_data(
-        Rc::clone(core),
+        Arc::clone(core),
         image.raw_data,
-        vk::Extent3D {
-            width: image.width as u32,
-            height: image.height as u32,
-            depth: 1,
+        &vulkan_abstraction::image::ImageDesc {
+            extent: vk::Extent3D {
+                width: image.width as u32,
+                height: image.height as u32,
+                depth: 1,
+            },
+            format,
+            tiling: vk::ImageTiling::OPTIMAL,
+            location: gpu_allocator::MemoryLocation::GpuOnly,
+            usage: vk::ImageUsageFlags::SAMPLED,
+            name: "gltf image",
         },
-        format,
-        vk::ImageTiling::OPTIMAL,
-        gpu_allocator::MemoryLocation::GpuOnly,
-        vk::ImageUsageFlags::SAMPLED,
-        "gltf image",
     )?;
 
     Ok(image)

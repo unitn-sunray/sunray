@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use ash::vk;
@@ -30,7 +29,7 @@ pub struct ArenaGpuBuffer<T: Copy> {
     capacity: vk::DeviceSize,
     free_slots: Vec<usize>,
     pending_free_slots: VecDeque<(u64, usize)>,
-    core: Rc<vulkan_abstraction::Core>,
+    core: Arc<vulkan_abstraction::Core>,
     handle: Option<Handle<RawBuffer>>,
 }
 
@@ -65,7 +64,7 @@ impl<T: Copy> Buffer for ArenaGpuBuffer<T> {
         self.gpu_only.get_device_address()
     }
 
-    fn new_null(core: Rc<vulkan_abstraction::Core>) -> Self {
+    fn new_null(core: Arc<vulkan_abstraction::Core>) -> Self {
         Self {
             staging: StagingBuffer::new_null(core.clone()),
             gpu_only: Arc::new(GpuOnlyBuffer::new_null(core.clone())),
@@ -84,7 +83,7 @@ impl<T: Copy> ArenaBuffer for ArenaGpuBuffer<T> {
     }
 
     fn process_pending_frees(&mut self) {
-        let current_frame = *self.core.absolute_frame_count.borrow() as u64;
+        let current_frame = self.core.absolute_frame_count() as u64;
         while let Some(&(frame_freed, slot)) = self.pending_free_slots.front() {
             if current_frame >= frame_freed + MAX_FRAMES_IN_FLIGHT as u64 {
                 self.free_slots.push(slot);
@@ -98,7 +97,7 @@ impl<T: Copy> ArenaBuffer for ArenaGpuBuffer<T> {
 
 impl<T: Copy> ArenaGpuBuffer<T> {
     pub fn new(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         capacity: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
         name: &'static str,
@@ -132,7 +131,7 @@ impl<T: Copy> ArenaGpuBuffer<T> {
 
     #[allow(dead_code)]
     pub(crate) fn new_from_data(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         data: &[T],
         usage: vk::BufferUsageFlags,
         name: &'static str,
@@ -174,7 +173,7 @@ impl<T: Copy> ArenaGpuBuffer<T> {
     /// Write data to a specific slot in the ring-buffered staging area.
     /// Returns the slot and a `BufferCopy` region to submit on a command buffer.
     pub fn write_to_slot(&mut self, slot: usize, data: &T) -> SrResult<(usize, vk::BufferCopy)> {
-        let frame_module = *self.core.absolute_frame_count.borrow() % MAX_FRAMES_IN_FLIGHT;
+        let frame_module = self.core.absolute_frame_count() % MAX_FRAMES_IN_FLIGHT;
         let staging_index = slot + (self.capacity as usize * frame_module);
 
         let mapped = self.staging.map_mut()?;
@@ -216,7 +215,7 @@ impl<T: Copy> ArenaGpuBuffer<T> {
 
     /// Frees an index so it can be reused by future allocations.
     pub fn free_index(&mut self, index: usize) {
-        let current_frame = *self.core.absolute_frame_count.borrow() as u64;
+        let current_frame = self.core.absolute_frame_count() as u64;
         self.pending_free_slots.push_back((current_frame, index));
     }
 

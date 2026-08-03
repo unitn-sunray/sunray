@@ -25,17 +25,9 @@ use bevy_window::{CursorMoved, PrimaryWindow, Window};
 /// Holds the `egui::Context`. `egui::Context` is `Clone + Send + Sync` (it's an
 /// `Arc` internally), so this is a normal resource. Add UI from your own
 /// `Update` systems: `egui::Window::new("x").show(egui_ctx.ctx(), |ui| { .. })`.
-#[derive(Resource)]
+#[derive(Resource, Default)]
 pub struct EguiContext {
     ctx: egui::Context,
-}
-
-impl Default for EguiContext {
-    fn default() -> Self {
-        Self {
-            ctx: egui::Context::default(),
-        }
-    }
 }
 
 impl EguiContext {
@@ -170,12 +162,12 @@ fn egui_begin(
             });
         }
         // Text input: emit the produced text on press, skipping control chars.
-        if pressed {
-            if let Some(text) = &ev.text {
-                if !text.is_empty() && text.chars().all(|c| !c.is_control()) {
-                    events.push(egui::Event::Text(text.to_string()));
-                }
-            }
+        if pressed
+            && let Some(text) = &ev.text
+            && !text.is_empty()
+            && text.chars().all(|c| !c.is_control())
+        {
+            events.push(egui::Event::Text(text.to_string()));
         }
     }
 

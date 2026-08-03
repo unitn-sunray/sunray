@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use ash::vk;
 use parking_lot::lock_api::MutexGuard;
@@ -29,7 +29,6 @@ pub enum QueuesConf {
 /// A async compute
 ///
 /// Note: Always ask for the [`Config`](QueuesConf) to make sure you are not asking for the same mutex lock twice
-
 pub struct Queues {
     // one entry per distinct queue family actually used
     queues: Vec<Mutex<Queue>>,
@@ -41,7 +40,7 @@ pub struct Queues {
 }
 
 impl Queues {
-    pub fn new(device: &Rc<Device>) -> SrResult<Self> {
+    pub fn new(device: &Arc<Device>) -> SrResult<Self> {
         let graphics_family = device.graphics_queue_family_index();
 
         let mut families: Vec<u32> = Vec::new();
@@ -54,9 +53,9 @@ impl Queues {
             if let Some(index) = families.iter().position(|&f| f == family) {
                 return Ok(index);
             }
-            queues.push(Mutex::new(Queue::new(Rc::clone(device), 0, family)?));
+            queues.push(Mutex::new(Queue::new(Arc::clone(device), 0, family)?));
             pools.push(CmdPool::new(
-                Rc::clone(device),
+                Arc::clone(device),
                 family,
                 vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
             )?);

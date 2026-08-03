@@ -3,9 +3,10 @@
 //! This module replaces Bevy's stock wgpu `RenderPlugin` with a backend that
 //! drives [`crate::Renderer`] directly. It keeps Bevy's ECS, windowing (winit),
 //! input, time and transforms, and reuses `bevy_render::extract_plugin::ExtractPlugin`
-//! for the `RenderApp` SubApp + extraction bridge. Rendering is **single-threaded**
-//! (the renderer is `Rc`-based / `!Send`), so the render SubApp runs on the main
-//! thread and the renderer lives in a NonSend resource.
+//! for the `RenderApp` SubApp + extraction bridge. Rendering is **single-threaded**:
+//! the render SubApp runs on the main thread and the renderer lives in a NonSend
+//! resource. ([`crate::Renderer`] is `Send` but not `Sync`, and the swapchain must
+//! be presented from the thread that owns the window.)
 //!
 //! See `docs/bevy_integration.md` for the full architecture and
 //! `examples/bevy_app` for usage.
@@ -21,6 +22,11 @@
 //!     })
 //!     .run();
 //! ```
+
+// A Bevy system's parameter list *is* its ECS dependency declaration, and a
+// `Query`'s type *is* its filter — neither can be shortened into a struct
+// without losing what the scheduler reads. Both lints misfire on every system.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 mod asset;
 mod camera;

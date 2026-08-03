@@ -24,16 +24,40 @@ function Invoke-Step($Name, $ScriptBlock) {
     if ($LASTEXITCODE -ne 0) { throw "$Name failed (exit $LASTEXITCODE)" }
 }
 
-# Liveness, not correctness: a healthy window never exits on its own, so exiting
-# inside 10s is the failure signal. Covers both a panic and the graceful path,
-# since handle_srresult exits the event loop on any non-OUT_OF_DATE error.
-function Test-Liveness($Exe, $Seconds = 10) {
-    $p = Start-Process -FilePath $Exe -WorkingDirectory $PWD -PassThru
-    if ($p.WaitForExit($Seconds * 1000)) {
-        throw "$Exe exited early (code $($p.ExitCode))"
+# Two conditions, because surviving is not the same as working:
+#
+#   1. It must not exit inside $Seconds. A healthy window never exits on its own,
+#      so an early exit means a panic or the graceful error path (handle_srresult
+#      exits the event loop on any non-OUT_OF_DATE error).
+#   2. It must print $Heartbeat. A deadlocked renderer also never exits, so
+#      condition 1 alone reports a hung binary as healthy -- that is not
+#      hypothetical, it is how a swapchain-init deadlock once passed this check.
+#      The window example prints "[heartbeat] frame N fps F" once a second, which
+#      only happens if frames are actually being submitted.
+#
+# $Heartbeat is empty for bevy_app, which has no such output; that check stays
+# liveness-only and is non-fatal anyway.
+function Test-Liveness($Exe, $Seconds = 10, $Heartbeat = $null) {
+    $out = [System.IO.Path]::GetTempFileName()
+    try {
+        $p = Start-Process -FilePath $Exe -WorkingDirectory $PWD -PassThru -RedirectStandardOutput $out
+        if ($p.WaitForExit($Seconds * 1000)) {
+            throw "$Exe exited early (code $($p.ExitCode))"
+        }
+        $p.Kill(); $p.WaitForExit()
+
+        if ($Heartbeat) {
+            $beats = @(Select-String -Path $out -Pattern $Heartbeat -SimpleMatch)
+            if ($beats.Count -lt 2) {
+                throw "$Exe stayed alive but only produced $($beats.Count) '$Heartbeat' line(s) in ${Seconds}s -- it is running but not rendering (deadlock?)"
+            }
+            Write-Host "$Exe rendered for ${Seconds}s ($($beats.Count) heartbeats)" -ForegroundColor Green
+        } else {
+            Write-Host "$Exe survived ${Seconds}s" -ForegroundColor Green
+        }
+    } finally {
+        Remove-Item $out -ErrorAction SilentlyContinue
     }
-    $p.Kill(); $p.WaitForExit()
-    Write-Host "$Exe survived ${Seconds}s" -ForegroundColor Green
 }
 
 Invoke-Step 'Test (incl. GPU)' { cargo test --release -- --include-ignored }
@@ -50,7 +74,7 @@ Write-Host "pixel-identical ($got)" -ForegroundColor Green
 
 Write-Host "`n=== Smoke-test window example (10s) ===" -ForegroundColor Cyan
 Invoke-Step 'Build window example' { cargo build --release --example window }
-Test-Liveness 'target\release\examples\window.exe'
+Test-Liveness 'target\release\examples\window.exe' -Heartbeat '[heartbeat]'
 
 # Optional, matching `continue-on-error: true` in the workflow: reported but never
 # fatal, so a moving bevy integration can't block everything else.

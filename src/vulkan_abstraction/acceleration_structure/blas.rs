@@ -1,5 +1,4 @@
 use std::hash::Hash;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::error::*;
@@ -135,7 +134,7 @@ impl Blas {
     /// Emissive triangles are no longer tracked here — the `ResourceManager` owns
     /// the per-BLAS emissive triangle slots.
     pub fn new(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         vertex_buffer: VertexBuffer,
         index_buffer: IndexBuffer,
         build_type: BuildType,
@@ -165,7 +164,7 @@ impl Blas {
     /// `ALLOW_COMPACTION` (required before [`Self::record_compaction`] /
     /// [`Self::compact_sync`]) or `ALLOW_UPDATE` (required before [`Self::update`]).
     pub fn new_with_build_flags(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         vertex_buffer: VertexBuffer,
         index_buffer: IndexBuffer,
         flags: vk::BuildAccelerationStructureFlagsKHR,
@@ -201,7 +200,7 @@ impl Blas {
     /// synchronous path is *who* records + submits the build.
     #[allow(dead_code)]
     pub fn new_deferred(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         vertex_buffer: VertexBuffer,
         index_buffer: IndexBuffer,
         build_type: BuildType,
@@ -283,7 +282,7 @@ impl Blas {
 
     #[allow(unused)]
     pub fn rebuild(&mut self, vertex_buffer: VertexBuffer, index_buffer: IndexBuffer, build_type: BuildType) -> SrResult<()> {
-        *self = Self::new(Rc::clone(self.accel.core()), vertex_buffer, index_buffer, build_type)?;
+        *self = Self::new(Arc::clone(self.accel.core()), vertex_buffer, index_buffer, build_type)?;
         log::debug!("BLAS rebuilt");
         Ok(())
     }
@@ -372,8 +371,8 @@ impl Blas {
             ));
         }
 
-        let core = Rc::clone(self.accel.core());
-        let pool = CompactionQueryPool::new(Rc::clone(&core), 1)?;
+        let core = Arc::clone(self.accel.core());
+        let pool = CompactionQueryPool::new(Arc::clone(&core), 1)?;
 
         // The BLAS build already completed synchronously (queue idle), so the
         // size query can read it without an extra barrier.

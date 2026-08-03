@@ -1,8 +1,5 @@
-use std::{
-    cell::{Ref, RefCell},
-    collections::HashSet,
-    ffi::CStr,
-};
+use parking_lot::{RwLock, RwLockReadGuard};
+use std::{collections::HashSet, ffi::CStr};
 
 use crate::vulkan_abstraction::diagnostics::{self, DiagnosticTool};
 use crate::{error::*, vulkan_abstraction};
@@ -23,7 +20,7 @@ pub struct Device {
     graphics_queue_family_index: u32,
     transfer_queue_family_index: Option<u32>,
     async_compute_queue_family_index: Option<u32>,
-    surface_support_details: Option<RefCell<SurfaceSupportDetails>>,
+    surface_support_details: Option<RwLock<SurfaceSupportDetails>>,
 }
 
 impl Device {
@@ -70,7 +67,7 @@ impl Device {
                     let surface_support_details =
                         SurfaceSupportDetails::new(*surface, surface_instance, physical_device).unwrap();
                     if surface_support_details.check_swapchain_support() {
-                        Some((physical_device, Some(RefCell::new(surface_support_details))))
+                        Some((physical_device, Some(RwLock::new(surface_support_details))))
                     } else {
                         None
                     }
@@ -378,11 +375,16 @@ impl Device {
         self.async_compute_queue_family_index
     }
 
-    pub fn surface_support_details(&self) -> Ref<'_, SurfaceSupportDetails> {
-        self.surface_support_details.as_ref().unwrap().borrow()
+    /// `read_recursive`, not `read`: callers routinely hold two of these guards at
+    /// once (e.g. `build_swapchain` reads `surface_formats` and `surface_capabilities`
+    /// in the same scope). Plain `read` can deadlock on the second one if a writer
+    /// has queued in between; this used to be a `RefCell`, where overlapping shared
+    /// borrows were always legal.
+    pub fn surface_support_details(&self) -> RwLockReadGuard<'_, SurfaceSupportDetails> {
+        self.surface_support_details.as_ref().unwrap().read_recursive()
     }
     pub fn update_surface_support_details(&self, surface: vk::SurfaceKHR, surface_instance: &khr::surface::Instance) {
-        *self.surface_support_details.as_ref().unwrap().borrow_mut() =
+        *self.surface_support_details.as_ref().unwrap().write() =
             SurfaceSupportDetails::new(surface, surface_instance, self.physical_device).unwrap();
     }
 }

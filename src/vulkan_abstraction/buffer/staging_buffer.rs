@@ -5,17 +5,19 @@ use crate::{impl_buffer_trait, vulkan_abstraction};
 use ash::vk;
 use ash::vk::DeviceSize;
 use std::marker::PhantomData;
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub struct StagingBuffer<T> {
     raw: RawBuffer,
-    _marker: PhantomData<T>,
+    // `fn() -> T` rather than `T`: this is a type tag for a byte buffer, and the
+    // plain form would make the buffer non-`Send` for any non-`Send` `T`.
+    _marker: PhantomData<fn() -> T>,
 }
 
 impl_buffer_trait!(StagingBuffer<T>);
 
 impl<T> StagingBuffer<T> {
-    pub fn new_temp(core: Rc<vulkan_abstraction::Core>, len: vk::DeviceSize) -> SrResult<Self> {
+    pub fn new_temp(core: Arc<vulkan_abstraction::Core>, len: vk::DeviceSize) -> SrResult<Self> {
         //TODO this gets used for new from data and it has no flags
         let byte_size = (len * std::mem::size_of::<T>() as vk::DeviceSize) as vk::DeviceSize;
         let raw = RawBuffer::new_aligned(
@@ -33,7 +35,7 @@ impl<T> StagingBuffer<T> {
     }
 
     pub fn new(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         len: vk::DeviceSize,
         buffer_usage_flags: vk::BufferUsageFlags,
         name: &'static str,
@@ -53,7 +55,7 @@ impl<T> StagingBuffer<T> {
         })
     }
 
-    pub fn new_temp_from_data(core: Rc<vulkan_abstraction::Core>, data: &[T]) -> SrResult<Self>
+    pub fn new_temp_from_data(core: Arc<vulkan_abstraction::Core>, data: &[T]) -> SrResult<Self>
     where
         T: Copy,
     {
@@ -70,7 +72,7 @@ impl<T> StagingBuffer<T> {
     }
 
     pub fn new_from_data(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         data: &[T],
         buffer_usage_flags: vk::BufferUsageFlags,
         name: &'static str,
@@ -91,7 +93,7 @@ impl<T> StagingBuffer<T> {
     }
 
     pub fn new_from_data_with_custom_length(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         data: &[T],
         len: vk::DeviceSize,
         buffer_usage_flags: vk::BufferUsageFlags,

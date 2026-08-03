@@ -17,9 +17,8 @@ use crate::vulkan_abstraction::descriptor_heap::{DescriptorSlot, ResourceDescrip
 use crate::{error::*, vulkan_abstraction};
 use ash::vk;
 use ash::vk::{BufferUsageFlags, DeviceAddress, DeviceSize, Handle};
-use std::cell::Cell;
+use parking_lot::Mutex;
 use std::fmt::{Debug, Formatter};
-use std::rc::Rc;
 use std::sync::Arc;
 
 //TODO revert capacity as vk::device length some methods signatures
@@ -33,22 +32,18 @@ pub fn get_memory_type_index(
     let bits: BitsType = mem_requirements.memory_type_bits;
     assert_ne!(bits, 0);
 
+    // `memory_types` is VK_MAX_MEMORY_TYPES (32) long, exactly the width of the
+    // `memory_type_bits` mask, so the index and the bit position line up.
     let mem_types = core.device().memory_properties().memory_types;
-    let mut idx = -1;
-    for i in 0..BitsType::BITS as usize {
-        let mem_type_is_supported = bits & (1 << i) != 0;
-        if mem_type_is_supported && mem_types[i].property_flags & mem_prop_flags == mem_prop_flags {
-            idx = i as isize;
-            break;
-        }
-    }
-    if idx < 0 {
-        return Err(SrError::new_custom("Vertex Buffer Memory Type not supported!".to_string()));
-    }
-
-    Ok(idx as u32)
+    debug_assert_eq!(mem_types.len(), BitsType::BITS as usize);
+    mem_types
+        .iter()
+        .enumerate()
+        .position(|(i, t)| bits & (1 << i) != 0 && t.property_flags & mem_prop_flags == mem_prop_flags)
+        .map(|idx| idx as u32)
+        .ok_or_else(|| SrError::new_custom("Vertex Buffer Memory Type not supported!".to_string()))
 }
-pub trait Buffer {
+pub trait Buffer: Send + Sync {
     fn inner(&self) -> vk::Buffer;
 
     fn usage(&self) -> BufferUsageFlags;
@@ -60,7 +55,7 @@ pub trait Buffer {
     fn byte_size(&self) -> vk::DeviceSize;
     fn is_null(&self) -> bool;
     fn get_device_address(&self) -> vk::DeviceAddress;
-    fn new_null(core: Rc<vulkan_abstraction::Core>) -> Self
+    fn new_null(core: Arc<vulkan_abstraction::Core>) -> Self
     where
         Self: Sized;
 }
@@ -80,17 +75,21 @@ pub trait HostAccessibleBuffer<T>: Buffer {
     }
 
     fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 pub struct RawBuffer {
-    core: Rc<vulkan_abstraction::Core>,
+    core: Arc<vulkan_abstraction::Core>,
     buffer: vk::Buffer,
     allocation: gpu_allocator::vulkan::Allocation,
     byte_size: u64,
     usage: BufferUsageFlags,
     /// Lazily-allocated heap slot for `UNIFORM_BUFFER` descriptors.
-    uniform_slot: Cell<Option<DescriptorSlot>>,
+    uniform_slot: Mutex<Option<DescriptorSlot>>,
     /// Lazily-allocated heap slot for `STORAGE_BUFFER` descriptors.
-    storage_slot: Cell<Option<DescriptorSlot>>,
+    storage_slot: Mutex<Option<DescriptorSlot>>,
     /// True when this RawBuffer holds its own `Allocation`. False when memory is
     /// owned elsewhere (e.g. by a transient alias slot in `TransientResources`);
     /// `Drop` still destroys the `vk::Buffer` but skips `Allocator::free`.
@@ -125,15 +124,15 @@ impl Buffer for RawBuffer {
         self.device_address()
     }
 
-    fn new_null(core: Rc<vulkan_abstraction::Core>) -> Self {
+    fn new_null(core: Arc<vulkan_abstraction::Core>) -> Self {
         Self {
             core,
             buffer: vk::Buffer::null(),
             allocation: gpu_allocator::vulkan::Allocation::default(),
             byte_size: 0,
             usage: BufferUsageFlags::empty(),
-            uniform_slot: Cell::new(None),
-            storage_slot: Cell::new(None),
+            uniform_slot: Mutex::new(None),
+            storage_slot: Mutex::new(None),
             // Null buffer: the existing `Drop` early-returns on null anyway, but mark
             // ownership consistent with `new_aligned`.
             owns_memory: true,
@@ -141,7 +140,7 @@ impl Buffer for RawBuffer {
     }
 }
 
-// `RawBuffer` can't `#[derive(Debug)]`: its `core: Rc<Core>` field doesn't
+// `RawBuffer` can't `#[derive(Debug)]`: its `core: Arc<Core>` field doesn't
 // implement `Debug` (and `Allocation` / the `Cell` slots aren't worth printing).
 // A hand-written impl lets `Debug` types that hold a `RawBuffer` (e.g.
 // `Arc<RawBuffer>` inside `TlasBuildDesc` / `ASDesc`) derive `Debug` normally.
@@ -158,7 +157,7 @@ impl Debug for RawBuffer {
 
 impl RawBuffer {
     /// Construct a buffer from a render-graph descriptor.
-    pub fn new_from_desc(core: Rc<vulkan_abstraction::Core>, desc: &BufferDesc) -> SrResult<Self> {
+    pub fn new_from_desc(core: Arc<vulkan_abstraction::Core>, desc: &BufferDesc) -> SrResult<Self> {
         Self::new_aligned(
             core,
             desc.byte_size,
@@ -170,7 +169,7 @@ impl RawBuffer {
     }
 
     pub fn new_aligned(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         byte_size: vk::DeviceSize,
         alignment: u64,
         memory_location: gpu_allocator::MemoryLocation,
@@ -216,8 +215,8 @@ impl RawBuffer {
             allocation,
             byte_size,
             usage: buffer_usage_flags,
-            uniform_slot: Cell::new(None),
-            storage_slot: Cell::new(None),
+            uniform_slot: Mutex::new(None),
+            storage_slot: Mutex::new(None),
             owns_memory: true,
         })
     }
@@ -242,7 +241,7 @@ impl RawBuffer {
     /// Wrap an already-bound `vk::Buffer` whose memory is owned elsewhere. `Drop`
     /// will destroy the handle but NOT free the memory.
     pub(crate) fn from_aliased(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         buffer: vk::Buffer,
         byte_size: u64,
         usage: vk::BufferUsageFlags,
@@ -253,8 +252,8 @@ impl RawBuffer {
             allocation: gpu_allocator::vulkan::Allocation::default(),
             byte_size,
             usage,
-            uniform_slot: Cell::new(None),
-            storage_slot: Cell::new(None),
+            uniform_slot: Mutex::new(None),
+            storage_slot: Mutex::new(None),
             owns_memory: false,
         })
     }
@@ -282,8 +281,11 @@ impl RawBuffer {
         self.descriptor_slot(&self.storage_slot, ResourceDescriptorKind::StorageBuffer)
     }
 
-    fn descriptor_slot(&self, cell: &Cell<Option<DescriptorSlot>>, kind: ResourceDescriptorKind) -> u32 {
-        if let Some(s) = cell.get() {
+    // The cache lock is held across the heap lock so two threads can't both decide
+    // the slot is unallocated and leak one. Lock order is always cache -> heap.
+    fn descriptor_slot(&self, cell: &Mutex<Option<DescriptorSlot>>, kind: ResourceDescriptorKind) -> u32 {
+        let mut cached = cell.lock();
+        if let Some(s) = *cached {
             return s.shader_index();
         }
         debug_assert!(!self.buffer.is_null(), "cannot allocate descriptor slot for null buffer");
@@ -293,7 +295,7 @@ impl RawBuffer {
         let slot = heap.alloc_resource_slot(kind);
         heap.write_buffer(slot, address, self.byte_size, kind)
             .expect("descriptor heap write_buffer failed");
-        cell.set(Some(slot));
+        *cached = Some(slot);
         slot.shader_index()
     }
 
@@ -323,10 +325,10 @@ impl Drop for RawBuffer {
         if self.buffer != vk::Buffer::null() {
             {
                 let mut heap = self.core.descriptor_heap_mut();
-                if let Some(s) = self.uniform_slot.get() {
+                if let Some(s) = *self.uniform_slot.lock() {
                     heap.free(s);
                 }
-                if let Some(s) = self.storage_slot.get() {
+                if let Some(s) = *self.storage_slot.lock() {
                     heap.free(s);
                 }
             }
@@ -383,7 +385,7 @@ macro_rules! impl_buffer_trait {
                 unsafe { self.raw.core.device().inner().get_buffer_device_address(&info) }
             }
 
-            fn new_null(core: Rc<vulkan_abstraction::Core>) -> Self {
+            fn new_null(core: Arc<vulkan_abstraction::Core>) -> Self {
                 Self {
                     raw: RawBuffer::new_null(core),
                     _marker: Default::default(),
@@ -427,7 +429,7 @@ macro_rules! impl_buffer_trait {
                 unsafe { self.raw.core.device().inner().get_buffer_device_address(&info) }
             }
 
-            fn new_null(core: Rc<vulkan_abstraction::Core>) -> Self {
+            fn new_null(core: Arc<vulkan_abstraction::Core>) -> Self {
                 Self {
                     raw: RawBuffer::new_null(core),
                 }

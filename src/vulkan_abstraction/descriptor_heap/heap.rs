@@ -82,6 +82,9 @@ pub struct DescriptorHeap {
 }
 
 impl DescriptorHeap {
+    // The four capacities and the two ash loaders are all independent knobs with
+    // no natural grouping; a params struct here would have exactly one caller.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &ash::Device,
         ext: &ext::descriptor_heap::Device,
@@ -456,6 +459,9 @@ impl Drop for DescriptorHeap {
 }
 
 impl ResourceSubHeap {
+    // Private, one call site, and every argument is a distinct heap-layout figure
+    // already computed by that caller.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         device: &ash::Device,
         allocator: &mut Allocator,
@@ -508,6 +514,8 @@ impl ResourceSubHeap {
 }
 
 impl SamplerSubHeap {
+    // See `ResourceSubHeap::new`.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         device: &ash::Device,
         allocator: &mut Allocator,

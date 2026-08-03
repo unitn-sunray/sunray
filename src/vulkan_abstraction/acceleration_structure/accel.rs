@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::error::*;
 use crate::vulkan_abstraction;
@@ -30,12 +30,16 @@ pub struct AsBuildInputs {
 /// satisfies `scratch_alignment`, then calls [`AsBuildJob::record`] exactly once.
 /// Both the scratch buffer and the geometry buffers the build reads must stay
 /// alive until that command buffer's submission completes.
+/// Records one deferred acceleration-structure build into a command buffer,
+/// given the scratch buffer the caller allocated for it.
+type AsRecordFn = dyn FnOnce(vk::CommandBuffer, &vulkan_abstraction::GpuOnlyBuffer) + Send;
+
 pub struct AsBuildJob {
     /// Minimum size, in bytes, of the scratch buffer passed to [`Self::record`].
     pub scratch_size: vk::DeviceSize,
     /// Alignment the scratch buffer's device address must satisfy.
     pub scratch_alignment: u64,
-    record: Box<dyn FnOnce(vk::CommandBuffer, &vulkan_abstraction::GpuOnlyBuffer)>,
+    record: Box<AsRecordFn>,
 }
 
 impl AsBuildJob {
@@ -61,7 +65,7 @@ impl AsBuildJob {
 /// `vk::AccelerationStructureKHR` handle (only an address), is expected to be a
 /// *sibling* resource type exposing the same `device_address()`.
 pub struct AccelerationStructure {
-    core: Rc<vulkan_abstraction::Core>,
+    core: Arc<vulkan_abstraction::Core>,
     handle: vk::AccelerationStructureKHR,
     #[allow(dead_code)]
     buffer: vulkan_abstraction::GpuOnlyBuffer,
@@ -79,7 +83,7 @@ impl AccelerationStructure {
     /// `scratch_alignment`, then calls [`AsBuildJob::record`] with a command
     /// buffer and that scratch. This is the seam the render graph runs the build
     /// through — the recording closure is `'static` (it owns `inputs`).
-    pub fn build(core: Rc<vulkan_abstraction::Core>, inputs: AsBuildInputs) -> SrResult<(Self, AsBuildJob)> {
+    pub fn build(core: Arc<vulkan_abstraction::Core>, inputs: AsBuildInputs) -> SrResult<(Self, AsBuildJob)> {
         assert_eq!(inputs.geometries.len(), inputs.ranges.len());
         let AsBuildInputs {
             ty,
@@ -117,7 +121,7 @@ impl AccelerationStructure {
         // holding only device addresses) so it satisfies the graph's `'static`
         // render-closure bound. `handle` is `Copy` — the same handle lives both
         // in `Self` and here.
-        let record_core = Rc::clone(&core);
+        let record_core = Arc::clone(&core);
         let record = Box::new(
             move |cmd_buf: vk::CommandBuffer, scratch: &vulkan_abstraction::GpuOnlyBuffer| {
                 let build_geometry_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
@@ -159,13 +163,13 @@ impl AccelerationStructure {
     /// buffer: allocate scratch, record + submit + wait + free). Behaviorally
     /// identical to the old `new_sync`; used by the classic path. Internally it
     /// just runs the deferred [`Self::build`] job on a throwaway command buffer.
-    pub fn build_sync(core: Rc<vulkan_abstraction::Core>, inputs: AsBuildInputs) -> SrResult<Self> {
-        let (accel, job) = Self::build(Rc::clone(&core), inputs)?;
+    pub fn build_sync(core: Arc<vulkan_abstraction::Core>, inputs: AsBuildInputs) -> SrResult<Self> {
+        let (accel, job) = Self::build(Arc::clone(&core), inputs)?;
 
         // The scratch must outlive the submit — it does, dropped at end of scope
         // after `submit_sync` has waited for the build to finish.
         let scratch = vulkan_abstraction::GpuOnlyBuffer::new_aligned::<u8>(
-            Rc::clone(&core),
+            Arc::clone(&core),
             job.scratch_size,
             job.scratch_alignment,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS | vk::BufferUsageFlags::STORAGE_BUFFER,
@@ -245,7 +249,7 @@ impl AccelerationStructure {
             .min_acceleration_structure_scratch_offset_alignment as u64;
 
         let handle = self.handle;
-        let record_core = Rc::clone(&self.core);
+        let record_core = Arc::clone(&self.core);
         let record = Box::new(
             move |cmd_buf: vk::CommandBuffer, scratch: &vulkan_abstraction::GpuOnlyBuffer| {
                 let build_geometry_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
@@ -284,7 +288,7 @@ impl AccelerationStructure {
         let job = self.update(inputs)?;
 
         let scratch = vulkan_abstraction::GpuOnlyBuffer::new_aligned::<u8>(
-            Rc::clone(&self.core),
+            Arc::clone(&self.core),
             job.scratch_size,
             job.scratch_alignment,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS | vk::BufferUsageFlags::STORAGE_BUFFER,
@@ -343,7 +347,7 @@ impl AccelerationStructure {
         }
 
         Ok(Self {
-            core: Rc::clone(&self.core),
+            core: Arc::clone(&self.core),
             handle,
             buffer,
             device_address,
@@ -353,7 +357,7 @@ impl AccelerationStructure {
     /// Allocate a backing buffer of `size`, create an AS handle of type `ty` on
     /// it, and read back its device address. Shared by build and compaction.
     fn create_backed(
-        core: &Rc<vulkan_abstraction::Core>,
+        core: &Arc<vulkan_abstraction::Core>,
         ty: vk::AccelerationStructureTypeKHR,
         size: vk::DeviceSize,
     ) -> SrResult<(
@@ -362,7 +366,7 @@ impl AccelerationStructure {
         vk::DeviceAddress,
     )> {
         let buffer = vulkan_abstraction::GpuOnlyBuffer::new::<u8>(
-            Rc::clone(core),
+            Arc::clone(core),
             size,
             vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
@@ -412,7 +416,7 @@ impl AccelerationStructure {
         self.handle
     }
 
-    pub fn core(&self) -> &Rc<vulkan_abstraction::Core> {
+    pub fn core(&self) -> &Arc<vulkan_abstraction::Core> {
         &self.core
     }
 }

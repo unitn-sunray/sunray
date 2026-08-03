@@ -13,31 +13,32 @@ use crate::vulkan_abstraction::Queue;
 use crate::vulkan_abstraction::diagnostics::DiagnosticTool;
 use crate::{CreateSurfaceFn, error::*};
 use ash::{ext, khr, vk};
-use parking_lot::RawMutex;
-use parking_lot::lock_api::MutexGuard;
-use std::cell::{Ref, RefCell, RefMut};
+use parking_lot::{Mutex, MutexGuard};
 use std::ffi::CStr;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[rustfmt::skip]
 pub struct Core {
-    //TODO core is completely single thread
     //TODO core gets distributed way too often when only the device is needed most of the time
-    
+
+    // `Core` is `Send + Sync`: every field is either immutable after construction or
+    // behind a `Mutex`. That is *thread-safety of the wrapper*, not of Vulkan — the
+    // usual external-synchronization rules for a `VkDevice`'s children still apply.
     // Note: do not reorder the fields in this struct: they will be dropped in the same order they are declared
-    pub absolute_frame_count: RefCell<usize>,
+    absolute_frame_count: AtomicUsize,
 
     acceleration_structure_device: khr::acceleration_structure::Device,
     ray_tracing_pipeline_device: khr::ray_tracing_pipeline::Device,
     descriptor_heap_device: ext::descriptor_heap::Device, //TODO don't know where to put these params as the almost seem more fit into the descriptor heap and this whole thing could even go in resource manager
     descriptor_heap_instance: ext::descriptor_heap::Instance,
-    descriptor_heap: RefCell<vulkan_abstraction::DescriptorHeap>,
+    descriptor_heap: Mutex<vulkan_abstraction::DescriptorHeap>,
 
     queues: vulkan_abstraction::Queues,
 
-    allocator: RefCell<Allocator>,
+    allocator: Mutex<Allocator>,
 
-    device: Rc<vulkan_abstraction::Device>,
+    device: Arc<vulkan_abstraction::Device>,
     instance: vulkan_abstraction::Instance,
     entry: ash::Entry,
 }
@@ -108,7 +109,7 @@ impl Core {
             device_extensions.push(ext_name.as_ptr());
         }
 
-        let device = Rc::new(Device::new(
+        let device = Arc::new(Device::new(
             &instance,
             &device_extensions,
             diagnostics,
@@ -161,16 +162,16 @@ impl Core {
 
         Ok((
             Self {
-                absolute_frame_count: RefCell::new(0),
+                absolute_frame_count: AtomicUsize::new(0),
                 entry,
                 instance,
                 device,
-                allocator: RefCell::new(allocator),
+                allocator: Mutex::new(allocator),
                 acceleration_structure_device,
                 ray_tracing_pipeline_device,
                 descriptor_heap_device,
                 descriptor_heap_instance,
-                descriptor_heap: RefCell::new(descriptor_heap),
+                descriptor_heap: Mutex::new(descriptor_heap),
                 queues,
             },
             surface_support.map(|(s, _)| s),
@@ -187,11 +188,11 @@ impl Core {
         self.instance.inner()
     }
 
-    pub fn device(&self) -> &Rc<vulkan_abstraction::Device> {
+    pub fn device(&self) -> &Arc<vulkan_abstraction::Device> {
         &self.device
     }
 
-    pub fn clone_device(&self) -> Rc<vulkan_abstraction::Device> {
+    pub fn clone_device(&self) -> Arc<vulkan_abstraction::Device> {
         self.device.clone()
     }
 
@@ -205,35 +206,49 @@ impl Core {
         &self.queues
     }
 
-    pub fn graphics_queue(&self) -> MutexGuard<'_, RawMutex, Queue> {
+    /// Frames retired since startup. Every caller only ever compares or offsets
+    /// this, so `Relaxed` is enough — there is no data published alongside it.
+    pub fn absolute_frame_count(&self) -> usize {
+        self.absolute_frame_count.load(Ordering::Relaxed)
+    }
+
+    /// Retire a frame and return the new count.
+    pub fn advance_frame(&self) -> usize {
+        self.absolute_frame_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn graphics_queue(&self) -> MutexGuard<'_, Queue> {
         self.queues.graphics()
     }
 
-    pub fn transfer_queue(&self) -> MutexGuard<'_, RawMutex, Queue> {
+    pub fn transfer_queue(&self) -> MutexGuard<'_, Queue> {
         self.queues.transfer()
     }
 
-    pub fn async_compute_queue(&self) -> MutexGuard<'_, RawMutex, Queue> {
+    pub fn async_compute_queue(&self) -> MutexGuard<'_, Queue> {
         self.queues.async_compute()
     }
 
-    pub fn allocator(&self) -> Ref<'_, Allocator> {
-        self.allocator.borrow()
-    }
-    pub fn allocator_mut(&self) -> RefMut<'_, Allocator> {
-        self.allocator.borrow_mut()
+    /// `Mutex`, not `RwLock`: `gpu_allocator::Allocator` is `Send` but not `Sync`
+    /// (it holds the mapped-memory `NonNull`s), and every caller needs `&mut`
+    /// anyway — there was never a read-only borrow of it.
+    pub fn allocator_mut(&self) -> MutexGuard<'_, Allocator> {
+        self.allocator.lock()
     }
 
     pub fn graphics_cmd_pool(&self) -> &vulkan_abstraction::CmdPool {
         self.queues.graphics_pool()
     }
 
-    pub fn descriptor_heap(&self) -> Ref<'_, vulkan_abstraction::DescriptorHeap> {
-        self.descriptor_heap.borrow()
+    /// `Mutex`, not `RwLock`: `DescriptorHeap` owns the heap's mapped-memory
+    /// `NonNull`s, so it is `Send` but not `Sync`. Every caller of either method
+    /// holds the guard for a single statement, so there is no overlap to serve.
+    pub fn descriptor_heap(&self) -> MutexGuard<'_, vulkan_abstraction::DescriptorHeap> {
+        self.descriptor_heap.lock()
     }
 
-    pub fn descriptor_heap_mut(&self) -> RefMut<'_, vulkan_abstraction::DescriptorHeap> {
-        self.descriptor_heap.borrow_mut()
+    pub fn descriptor_heap_mut(&self) -> MutexGuard<'_, vulkan_abstraction::DescriptorHeap> {
+        self.descriptor_heap.lock()
     }
 
     pub fn descriptor_heap_device(&self) -> &ext::descriptor_heap::Device {
@@ -301,8 +316,16 @@ impl Drop for Core {
     fn drop(&mut self) {
         // Free descriptor-heap GPU allocations explicitly while the allocator is still alive.
         // Without this gpu-allocator panics on its own drop because of unfreed allocations.
-        let mut heap = self.descriptor_heap.borrow_mut();
-        let mut allocator = self.allocator.borrow_mut();
+        let mut heap = self.descriptor_heap.lock();
+        let mut allocator = self.allocator.lock();
         heap.shutdown(&mut allocator);
     }
 }
+
+// The whole point of the Rc -> Arc migration. If a future field reintroduces
+// `Rc`/`RefCell`/`Cell`, this fails at compile time instead of silently making
+// every `Arc<Core>` in the crate pointless.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync + ?Sized>() {}
+    assert_send_sync::<Core>();
+};

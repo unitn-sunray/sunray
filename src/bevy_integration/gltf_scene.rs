@@ -141,25 +141,25 @@ fn spawn_node(
     mesh_count: &mut usize,
 ) {
     let node_entity = commands.spawn((node.transform, ChildOf(parent))).id();
-    if let Some(mesh_handle) = &node.mesh {
-        if let Some(gltf_mesh) = gltf_meshes.get(mesh_handle) {
-            for primitive in &gltf_mesh.primitives {
-                let material = primitive
-                    .material
-                    .as_ref()
-                    .and_then(|handle| materials.get(handle))
-                    .map(sunray_material)
-                    .unwrap_or_default();
-                commands.spawn((
-                    Transform::IDENTITY,
-                    ChildOf(node_entity),
-                    SunrayMeshInstance {
-                        mesh: primitive.mesh.clone(),
-                    },
-                    material,
-                ));
-                *mesh_count += 1;
-            }
+    if let Some(mesh_handle) = &node.mesh
+        && let Some(gltf_mesh) = gltf_meshes.get(mesh_handle)
+    {
+        for primitive in &gltf_mesh.primitives {
+            let material = primitive
+                .material
+                .as_ref()
+                .and_then(|handle| materials.get(handle))
+                .map(sunray_material)
+                .unwrap_or_default();
+            commands.spawn((
+                Transform::IDENTITY,
+                ChildOf(node_entity),
+                SunrayMeshInstance {
+                    mesh: primitive.mesh.clone(),
+                },
+                material,
+            ));
+            *mesh_count += 1;
         }
     }
     for child in &node.children {

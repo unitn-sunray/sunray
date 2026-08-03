@@ -278,7 +278,7 @@ fn convert_mesh(mesh: &Mesh) -> Result<(Vec<sr_gltf::Vertex>, Vec<u32>), String>
         // Non-indexed: every 3 consecutive vertices form a triangle.
         None => (0..positions.len() as u32).collect(),
     };
-    if indices.len() % 3 != 0 {
+    if !indices.len().is_multiple_of(3) {
         return Err(format!("index count {} is not a multiple of 3", indices.len()));
     }
 

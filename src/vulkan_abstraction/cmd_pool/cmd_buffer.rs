@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::{error::*, vulkan_abstraction};
 use ash::vk;
@@ -51,13 +51,13 @@ fn new_command_buffer_vec_impl(
 pub struct CmdBuffer {
     handle: vk::CommandBuffer,
     fence: vulkan_abstraction::Fence,
-    core: Rc<vulkan_abstraction::Core>,
+    core: Arc<vulkan_abstraction::Core>,
 }
 
 impl CmdBuffer {
-    pub fn new(core: Rc<vulkan_abstraction::Core>) -> SrResult<Self> {
+    pub fn new(core: Arc<vulkan_abstraction::Core>) -> SrResult<Self> {
         let handle = vulkan_abstraction::cmd_buffer::new_command_buffer(core.graphics_cmd_pool(), core.device().inner())?;
-        let fence = vulkan_abstraction::Fence::new_signaled(Rc::clone(core.device()))?;
+        let fence = vulkan_abstraction::Fence::new_signaled(Arc::clone(core.device()))?;
         Ok(Self { core, handle, fence })
     }
     pub fn inner(&self) -> vk::CommandBuffer {

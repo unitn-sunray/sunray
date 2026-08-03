@@ -81,8 +81,8 @@ impl App {
     fn build_resources(&mut self, size: (u32, u32)) -> SrResult<()> {
         self.resources = None;
 
-        let display_handle = self.window.as_ref().unwrap().raw_display_handle().clone();
-        let window_handle = self.window.as_ref().unwrap().raw_window_handle().clone();
+        let display_handle = self.window.as_ref().unwrap().raw_display_handle();
+        let window_handle = self.window.as_ref().unwrap().raw_window_handle();
 
         let instance_exts = utils::enumerate_required_extensions(display_handle)?;
 
@@ -183,6 +183,13 @@ impl App {
                 if let Some(window) = &self.window {
                     window.set_title(&format!("Sunray Vulkan - FPS: {:.1}", fps));
                 }
+                // `println!`, not `log::info!`: the `log` crate is built with
+                // `release_max_level_warn`, so info is compiled out of release —
+                // and release is exactly where the smoke test needs this. It is
+                // the only evidence that frames are actually progressing; a
+                // deadlocked renderer stays alive and would otherwise pass.
+                //https://open.spotify.com/track/4ZJKi7HXFDG2emN6xIdbmV?si=a92ff6c0d1ec4c35
+                println!("[heartbeat] frame {} fps {fps:.1}", self.frame_count);
                 self.last_fps_check = Some(now);
                 self.frames_since_check = 0;
             }
@@ -223,11 +230,11 @@ impl App {
         }
 
         // At frame 240 remove the spawned duplicate.
-        if frame % 240 == 1 {
-            if let Some((blas_entry, transform_entry)) = self.spawned_instance.take() {
-                self.scene_instances[blas_entry].1.remove(transform_entry);
-                log::info!("[runtime test] removed duplicate instance of BLAS entry {blas_entry}");
-            }
+        if frame % 240 == 1
+            && let Some((blas_entry, transform_entry)) = self.spawned_instance.take()
+        {
+            self.scene_instances[blas_entry].1.remove(transform_entry);
+            log::info!("[runtime test] removed duplicate instance of BLAS entry {blas_entry}");
         }
     }
 
@@ -354,16 +361,16 @@ impl ApplicationHandler for App {
         _device_id: winit::event::DeviceId,
         event: DeviceEvent,
     ) {
-        if self.mouse_captured {
-            if let DeviceEvent::MouseMotion { delta } = event {
-                let sensitivity = 0.002;
-                self.camera_yaw += delta.0 as f32 * sensitivity;
-                self.camera_pitch -= delta.1 as f32 * sensitivity;
+        if self.mouse_captured
+            && let DeviceEvent::MouseMotion { delta } = event
+        {
+            let sensitivity = 0.002;
+            self.camera_yaw += delta.0 as f32 * sensitivity;
+            self.camera_pitch -= delta.1 as f32 * sensitivity;
 
-                // Clamp pitch so you don't break your neck looking backward through your legs
-                let limit = std::f32::consts::FRAC_PI_2 - 0.01;
-                self.camera_pitch = self.camera_pitch.clamp(-limit, limit);
-            }
+            // Clamp pitch so you don't break your neck looking backward through your legs
+            let limit = std::f32::consts::FRAC_PI_2 - 0.01;
+            self.camera_pitch = self.camera_pitch.clamp(-limit, limit);
         }
     }
 }
@@ -394,5 +401,5 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = App::default();
-    let _ = event_loop.run_app(&mut app).unwrap();
+    event_loop.run_app(&mut app).unwrap();
 }

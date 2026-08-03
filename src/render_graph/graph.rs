@@ -18,7 +18,6 @@ use ash::vk;
 use petgraph::visit::EdgeRef;
 use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
-use std::rc::Rc;
 use std::sync::Arc;
 use vk_sync_fork as vk_sync;
 use vk_sync_fork::AccessType;
@@ -104,9 +103,9 @@ pub struct PipelineHandle(u32);
 /// A heap-mode pipeline owned by the cache. RT additionally owns its shader
 /// binding table (built alongside the pipeline).
 pub(super) enum CachedPipeline {
-    Compute(Rc<ComputePipeline<HeapComputePass>>),
-    RayTracing(Rc<RayTracingPipeline>, Rc<ShaderBindingTable>),
-    Graphics(Rc<GraphicsPipeline>),
+    Compute(Arc<ComputePipeline<HeapComputePass>>),
+    RayTracing(Arc<RayTracingPipeline>, Arc<ShaderBindingTable>),
+    Graphics(Arc<GraphicsPipeline>),
 }
 
 /// Content-addressed cache of heap-mode pipelines, owned by the graph and kept
@@ -130,7 +129,7 @@ pub(super) enum CachedPipeline {
 pub(super) struct PipelineCache {
     entries: Vec<CachedPipeline>,
     by_key: HashMap<u64, PipelineHandle>,
-    core: Option<Rc<Core>>,
+    core: Option<Arc<Core>>,
 }
 
 impl PipelineCache {
@@ -143,7 +142,7 @@ impl PipelineCache {
     pub(super) fn intern(
         &mut self,
         key: u64,
-        core: &Rc<Core>,
+        core: &Arc<Core>,
         build: impl FnOnce() -> SrResult<CachedPipeline>,
     ) -> SrResult<PipelineHandle> {
         if let Some(handle) = self.by_key.get(&key) {
@@ -151,7 +150,7 @@ impl PipelineCache {
         }
         let entry = build()?;
         if self.core.is_none() {
-            self.core = Some(Rc::clone(core));
+            self.core = Some(Arc::clone(core));
         }
         let handle = PipelineHandle(self.entries.len() as u32);
         self.entries.push(entry);
@@ -480,20 +479,20 @@ pub struct RenderGraph {
     checkpoint_markers: HashMap<String, &'static std::ffi::CStr>,
     /// Cached so `run` can submit and `compile` can record without the caller
     /// having to re-thread `Core` through every call.
-    core: Rc<Core>,
+    core: Arc<Core>,
 }
 //TODO per frame global data uploaded each frame like transforms and the camera, these can then live in the descriptor heap based on kajiya DYNAMIC_CONSTANTS_BUFFER
 //TODO Reintroduce the typestate of the render graph,as it is intended to work like this, the setup phase is where you can add stuff and so on, when you want to run it you compile it once done than you can return to the setup phase, this should empty out reset the cmdbuffer and allow to add again resources, this should make sure the resources in use are
 //   not overwritten though while still allowing new resources to be added,also while on a built state it should be able to handle n frames in flight with internal sync to minimize the wait idle time and allow multiple frame to be run concurrently, this
 impl RenderGraph {
-    pub fn new(core: Rc<Core>) -> SrResult<Self> {
+    pub fn new(core: Arc<Core>) -> SrResult<Self> {
         let cmd_buffers = (0..MAX_FRAMES_IN_FLIGHT)
-            .map(|_| CmdBuffer::new(Rc::clone(&core)))
+            .map(|_| CmdBuffer::new(Arc::clone(&core)))
             .collect::<SrResult<Vec<_>>>()?;
         let transient_resources = (0..MAX_FRAMES_IN_FLIGHT).map(|_| TransientResources::default()).collect();
         let retired_passes = (0..MAX_FRAMES_IN_FLIGHT).map(|_| Vec::new()).collect();
         let retired_resources = (0..MAX_FRAMES_IN_FLIGHT).map(|_| Vec::new()).collect();
-        let graph_timeline = TimelineSemaphore::new(Rc::clone(&core), 0)?;
+        let graph_timeline = TimelineSemaphore::new(Arc::clone(&core), 0)?;
         Ok(RenderGraph {
             next_pass_id: 0,
             next_resource_id: 0,
@@ -517,7 +516,7 @@ impl RenderGraph {
     /// `compile` and `run` all run *after* `build_unified_graph` has incremented
     /// the absolute frame count, so this reads the frame being recorded.
     fn current_slot(&self) -> usize {
-        *self.core.absolute_frame_count.borrow() % MAX_FRAMES_IN_FLIGHT
+        self.core.absolute_frame_count() % MAX_FRAMES_IN_FLIGHT
     }
 
     /// Block until the frame that last used the upcoming frame's slot
@@ -528,7 +527,7 @@ impl RenderGraph {
     /// reclamation). Non-blocking in steady state — that frame completed long ago.
     /// Must be called *before* `build_unified_graph` increments the frame count.
     pub fn wait_for_slot_reuse(&self) -> SrResult<()> {
-        let upcoming = *self.core.absolute_frame_count.borrow() as u64 + 1;
+        let upcoming = self.core.absolute_frame_count() as u64 + 1;
         if upcoming > MAX_FRAMES_IN_FLIGHT as u64 {
             self.graph_timeline.wait(upcoming - MAX_FRAMES_IN_FLIGHT as u64)?;
         }
@@ -609,9 +608,9 @@ impl RenderGraph {
         self.next_resource_id += 1;
         id
     }
-    pub fn create_resource<Desc: ResourceDesc>(&mut self, desc: Desc) -> Handle<<Desc as ResourceDesc>::Resource>
+    pub fn create_resource<Desc>(&mut self, desc: Desc) -> Handle<<Desc as ResourceDesc>::Resource>
     where
-        Desc: TypeEquals<Other = <<Desc as ResourceDesc>::Resource as Resource>::Desc>,
+        Desc: ResourceDesc + TypeEquals<Other = <<Desc as ResourceDesc>::Resource as Resource>::Desc>,
     {
         self.create_raw_resource(desc.clone().into());
         Handle {
@@ -634,12 +633,12 @@ impl RenderGraph {
     ///
     /// Only images and buffers can be temporal; samplers / acceleration
     /// structures return an error.
-    pub fn create_temporal_resource<Desc: ResourceDesc>(
+    pub fn create_temporal_resource<Desc>(
         &mut self,
         desc: Desc,
     ) -> SrResult<ExportedTemporalResource<<Desc as ResourceDesc>::Resource>>
     where
-        Desc: TypeEquals<Other = <<Desc as ResourceDesc>::Resource as Resource>::Desc>,
+        Desc: ResourceDesc + TypeEquals<Other = <<Desc as ResourceDesc>::Resource as Resource>::Desc>,
     {
         let graph_desc: GraphResourceDesc = desc.clone().into();
 
@@ -662,7 +661,7 @@ impl RenderGraph {
 
         let index = self.temporal_resources.len();
         self.temporal_resources.push(TemporalResource {
-            frame_of_creation: *self.core.absolute_frame_count.borrow(),
+            frame_of_creation: self.core.absolute_frame_count(),
             imports,
         });
 
@@ -771,12 +770,12 @@ impl RenderGraph {
         self.virtual_resources.push(GraphResourceInfo::Created(resource_desc));
     }
 
-    pub fn import<Desc: ResourceDesc>(
+    pub fn import<Desc>(
         &mut self,
         res: impl RgImportable<Desc> + Into<GraphResourceImportInfo>,
     ) -> Handle<<Desc as ResourceDesc>::Resource>
     where
-        Desc: TypeEquals<Other = <<Desc as ResourceDesc>::Resource as Resource>::Desc>,
+        Desc: ResourceDesc + TypeEquals<Other = <<Desc as ResourceDesc>::Resource as Resource>::Desc>,
     {
         let desc = res.import();
         self.virtual_resources.push(GraphResourceInfo::Imported(res.into()));
@@ -793,13 +792,13 @@ impl RenderGraph {
     /// end-state back in and let the graph emit the hand-off barrier instead of a
     /// device-wide idle. Samplers / swapchain images carry no cross-frame access,
     /// so `usage` is ignored for them.
-    pub fn import_with_usage<Desc: ResourceDesc>(
+    pub fn import_with_usage<Desc>(
         &mut self,
         res: impl RgImportable<Desc> + Into<GraphResourceImportInfo>,
         usage: vk_sync::AccessType,
     ) -> Handle<<Desc as ResourceDesc>::Resource>
     where
-        Desc: TypeEquals<Other = <<Desc as ResourceDesc>::Resource as Resource>::Desc>,
+        Desc: ResourceDesc + TypeEquals<Other = <<Desc as ResourceDesc>::Resource as Resource>::Desc>,
     {
         let desc = res.import();
         let mut import = res.into();
@@ -831,7 +830,7 @@ impl RenderGraph {
         job: AsBuildJob,
     ) -> SrResult<()> {
         let scratch = GpuOnlyBuffer::new_aligned::<u8>(
-            Rc::clone(&self.core),
+            Arc::clone(&self.core),
             job.scratch_size,
             job.scratch_alignment,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS | vk::BufferUsageFlags::STORAGE_BUFFER,
@@ -869,9 +868,9 @@ impl RenderGraph {
     }
 
     /// The graph's cached `Core`. Pass builders use this so callers no longer
-    /// have to thread `Rc<Core>` into `generate_render` separately.
-    pub(crate) fn core(&self) -> Rc<Core> {
-        Rc::clone(&self.core)
+    /// have to thread `Arc<Core>` into `generate_render` separately.
+    pub(crate) fn core(&self) -> Arc<Core> {
+        Arc::clone(&self.core)
     }
 
     /// Intern a heap-mode compute pipeline for `spirv`, returning a handle the
@@ -879,22 +878,22 @@ impl RenderGraph {
     /// reused across frame rebuilds (see [`PipelineCache`]).
     pub(crate) fn cache_compute_pipeline(&mut self, spirv: &[u8]) -> SrResult<PipelineHandle> {
         let key = pipeline_cache_key(0, &[spirv]);
-        let core = Rc::clone(&self.core);
+        let core = Arc::clone(&self.core);
         let slot = self.current_slot();
         self.transient_resources[slot].pipeline_cache.intern(key, &core, || {
             let pipeline = ComputePipeline::<HeapComputePass>::new(core.clone_device(), spirv)?;
-            Ok(CachedPipeline::Compute(Rc::new(pipeline)))
+            Ok(CachedPipeline::Compute(Arc::new(pipeline)))
         })
     }
 
     /// Intern a heap-mode ray-tracing pipeline + its shader binding table.
     pub(crate) fn cache_raytracing_pipeline(&mut self, shaders: &RayTracingPipelineShaders) -> SrResult<PipelineHandle> {
         let key = pipeline_cache_key(1, &[&shaders.ray_gen, &shaders.miss, &shaders.closest_hit, &shaders.any_hit]);
-        let core = Rc::clone(&self.core);
+        let core = Arc::clone(&self.core);
         let slot = self.current_slot();
         self.transient_resources[slot].pipeline_cache.intern(key, &core, || {
-            let pipeline = Rc::new(RayTracingPipeline::new(Rc::clone(&core), shaders)?);
-            let sbt = Rc::new(ShaderBindingTable::new(&core, &pipeline)?);
+            let pipeline = Arc::new(RayTracingPipeline::new(Arc::clone(&core), shaders)?);
+            let sbt = Arc::new(ShaderBindingTable::new(&core, &pipeline)?);
             Ok(CachedPipeline::RayTracing(pipeline, sbt))
         })
     }
@@ -911,11 +910,11 @@ impl RenderGraph {
                 &shaders.color_format.as_raw().to_ne_bytes(),
             ],
         );
-        let core = Rc::clone(&self.core);
+        let core = Arc::clone(&self.core);
         let slot = self.current_slot();
         self.transient_resources[slot].pipeline_cache.intern(key, &core, || {
-            let pipeline = GraphicsPipeline::new(Rc::clone(&core), shaders)?;
-            Ok(CachedPipeline::Graphics(Rc::new(pipeline)))
+            let pipeline = GraphicsPipeline::new(Arc::clone(&core), shaders)?;
+            Ok(CachedPipeline::Graphics(Arc::new(pipeline)))
         })
     }
 
@@ -1161,7 +1160,12 @@ impl RenderGraph {
         }
         let components: Vec<PassComponent> = components_by_root.into_values().collect();
 
-        self.transient_resources[slot].populate(Rc::clone(&self.core), &self.virtual_resources, &components, &resource_usages)?;
+        self.transient_resources[slot].populate(
+            Arc::clone(&self.core),
+            &self.virtual_resources,
+            &components,
+            &resource_usages,
+        )?;
 
         // Linearize: the epoch walk groups each resource's usages in *schedule*
         // order, and the record loop below replays the same order.
@@ -1570,7 +1574,7 @@ impl RenderGraph {
             .collect();
 
         let dump = GraphDump {
-            frame: *self.core.absolute_frame_count.borrow() as u64,
+            frame: self.core.absolute_frame_count() as u64,
             pass_names: pass_names.to_vec(),
             edges,
             resources,
@@ -1752,7 +1756,7 @@ impl RenderGraph {
         extra_signals: &[(vk::Semaphore, u64, vk::PipelineStageFlags2)],
     ) -> SrResult<()> {
         let slot = self.current_slot();
-        let frame = *self.core.absolute_frame_count.borrow() as u64;
+        let frame = self.core.absolute_frame_count() as u64;
 
         let mut waits: Vec<(vk::Semaphore, u64, vk::PipelineStageFlags2)> = vec![(
             self.graph_timeline.inner(),
@@ -2137,7 +2141,7 @@ mod tests {
     #[test]
     #[ignore = "needs an RT-capable GPU (Core::new); run with --include-ignored"]
     fn transient_aliasing_debug() {
-        let core = Rc::new(Core::new(false, false, vk::Format::R8G8B8A8_UNORM).expect("Core::new failed"));
+        let core = Arc::new(Core::new(false, false, vk::Format::R8G8B8A8_UNORM).expect("Core::new failed"));
 
         let virtual_resources = vec![
             GraphResourceInfo::Created(GraphResourceDesc::Image(image(256, "img_256"))),
@@ -2172,7 +2176,7 @@ mod tests {
 
         let mut transient = TransientResources::default();
         transient
-            .populate(Rc::clone(&core), &virtual_resources, &components, &usages)
+            .populate(Arc::clone(&core), &virtual_resources, &components, &usages)
             .expect("populate failed");
 
         println!("{transient:?}");
@@ -2207,20 +2211,20 @@ mod tests {
     #[ignore = "needs an RT-capable GPU (Core::new); run with --include-ignored"]
     fn compile_runs_passes_in_topo_order() {
         use crate::render_graph::pass_builder::{ComputeRenderPassBuilder, PassCommonDataBuilder};
-        use std::cell::RefCell;
+        use parking_lot::Mutex;
 
-        let core = Rc::new(Core::new(false, false, vk::Format::R8G8B8A8_UNORM).expect("Core::new failed"));
-        let mut rg = RenderGraph::new(Rc::clone(&core)).expect("RenderGraph::new failed");
+        let core = Arc::new(Core::new(false, false, vk::Format::R8G8B8A8_UNORM).expect("Core::new failed"));
+        let mut rg = RenderGraph::new(Arc::clone(&core)).expect("RenderGraph::new failed");
         // Simulate being on frame 1 so `run` signals a valid (>0) timeline value
         // and the slot index is well-defined.
-        *core.absolute_frame_count.borrow_mut() += 1;
+        core.advance_frame();
         let slot = rg.current_slot();
 
         let img_a = rg.create_resource(image(64, "img_a"));
         let img_b = rg.create_resource(image(64, "img_b"));
 
         // Shared trace: each render closure pushes its name.
-        let trace: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let trace: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Pass 0: write img_a.
         let mut common0 = PassCommonDataBuilder::new(&mut rg, "producer");
@@ -2228,10 +2232,10 @@ mod tests {
             .write(&img_a, vk_sync::AccessType::ComputeShaderWrite)
             .expect("producer write");
         {
-            let trace = Rc::clone(&trace);
+            let trace = Arc::clone(&trace);
             common0.render(move |cb, _tr| {
                 assert_ne!(*cb, vk::CommandBuffer::null(), "producer got null cmd buffer");
-                trace.borrow_mut().push("producer");
+                trace.lock().push("producer");
                 Ok(())
             });
         }
@@ -2250,12 +2254,12 @@ mod tests {
             .write(&img_b, vk_sync::AccessType::ComputeShaderWrite)
             .expect("consumer write");
         {
-            let trace = Rc::clone(&trace);
+            let trace = Arc::clone(&trace);
             common1.render(move |cb, tr| {
                 assert_ne!(*cb, vk::CommandBuffer::null(), "consumer got null cmd buffer");
                 // img_a must be bound to a transient slot at this point.
                 assert!(tr.resource_slots.contains_key(&0), "img_a not bound after populate");
-                trace.borrow_mut().push("consumer");
+                trace.lock().push("consumer");
                 Ok(())
             });
         }
@@ -2273,7 +2277,7 @@ mod tests {
 
         // Both render closures must have fired, producer before consumer.
         {
-            let trace = trace.borrow();
+            let trace = trace.lock();
             assert_eq!(*trace, vec!["producer", "consumer"], "topo order violated");
         }
         // Persistent cmd buffer must be recorded.

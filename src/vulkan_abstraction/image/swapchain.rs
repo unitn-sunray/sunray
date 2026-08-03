@@ -1,14 +1,24 @@
 //! Swapchain + surface ownership for the Bevy integration.
 //!
 //! This is a near-verbatim port of `examples/window/{surface,swapchain}.rs`,
-//! folded into one module. It holds an `Rc<Core>` and ash loaders, so it is
-//! `!Send` and must live inside the [`SunrayRenderState`] NonSend
-//! resource, accessed only from the (single-threaded) render SubApp.
+//! folded into one module.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::{MAX_FRAMES_IN_FLIGHT, error::*, vulkan_abstraction};
 use ash::{khr, vk};
+
+/// Everything `build_swapchain` produces: the swapchain plus its images, views,
+/// and the extent/format/present-mode actually selected (which may differ from
+/// what the caller asked for).
+type SwapchainParts = (
+    vk::SwapchainKHR,
+    Vec<vk::Image>,
+    Vec<vk::ImageView>,
+    vk::Extent2D,
+    vk::Format,
+    vk::PresentModeKHR,
+);
 
 /// RAII wrapper that destroys the `vk::SurfaceKHR` on drop.
 pub struct Surface {
@@ -41,7 +51,7 @@ impl Drop for Surface {
 }
 
 pub struct Swapchain {
-    core: Rc<vulkan_abstraction::Core>,
+    core: Arc<vulkan_abstraction::Core>,
     swapchain_device: khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
     images: Vec<vk::Image>,
@@ -78,20 +88,13 @@ impl Swapchain {
     /// format and present mode actually selected so the owner can preserve them
     /// across a rebuild.
     fn build_swapchain(
-        core: &Rc<vulkan_abstraction::Core>,
+        core: &Arc<vulkan_abstraction::Core>,
         surface: vk::SurfaceKHR,
         window_extent: (u32, u32),
         old_swapchain: Option<vk::SwapchainKHR>,
         requested_format: Option<vk::Format>,
         requested_present_mode: Option<vk::PresentModeKHR>,
-    ) -> SrResult<(
-        vk::SwapchainKHR,
-        Vec<vk::Image>,
-        Vec<vk::ImageView>,
-        vk::Extent2D,
-        vk::Format,
-        vk::PresentModeKHR,
-    )> {
+    ) -> SrResult<SwapchainParts> {
         let instance = core.instance();
         let device = core.device();
         let swapchain_device = khr::swapchain::Device::load(instance, device.inner());
@@ -219,7 +222,7 @@ impl Swapchain {
     }
 
     pub fn new(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         surface: vk::SurfaceKHR,
         window_extent: (u32, u32),
         format: Option<vk::Format>,
@@ -345,16 +348,16 @@ pub struct SwapchainFrame {
 
 impl SwapchainData {
     pub(crate) fn new(
-        core: &Rc<vulkan_abstraction::Core>,
+        core: &Arc<vulkan_abstraction::Core>,
         surface: Surface,
         window_extent: (u32, u32),
         format: Option<vk::Format>,
         present_mode: Option<vk::PresentModeKHR>,
     ) -> SrResult<Self> {
-        let swapchain = Swapchain::new(Rc::clone(core), surface.inner(), window_extent, format, present_mode)?;
+        let swapchain = Swapchain::new(Arc::clone(core), surface.inner(), window_extent, format, present_mode)?;
 
         let img_acquired_sems = (0..MAX_FRAMES_IN_FLIGHT)
-            .map(|_| vulkan_abstraction::Semaphore::new(Rc::clone(core)))
+            .map(|_| vulkan_abstraction::Semaphore::new(Arc::clone(core)))
             .collect::<Result<Vec<_>, _>>()?;
         let img_rendered_frames = vec![0u64; MAX_FRAMES_IN_FLIGHT];
         let (present_barrier_cmd_bufs, ready_to_present_sems) = Self::build_per_image_objects(core, &swapchain)?;
@@ -375,14 +378,14 @@ impl SwapchainData {
     /// whenever the swapchain (and so its image list) is rebuilt.
     pub(crate) fn build_per_image_objects(
         //TODO this is the rg job
-        core: &Rc<vulkan_abstraction::Core>,
+        core: &Arc<vulkan_abstraction::Core>,
         swapchain: &Swapchain,
     ) -> SrResult<(Vec<vulkan_abstraction::CmdBuffer>, Vec<vulkan_abstraction::Semaphore>)> {
         let present_barrier_cmd_bufs = swapchain
             .images()
             .iter()
             .map(|image| -> SrResult<vulkan_abstraction::CmdBuffer> {
-                let cmd_buf = vulkan_abstraction::CmdBuffer::new(Rc::clone(core))?;
+                let cmd_buf = vulkan_abstraction::CmdBuffer::new(Arc::clone(core))?;
                 unsafe {
                     let begin_info = vk::CommandBufferBeginInfo::default();
                     core.device().inner().begin_command_buffer(cmd_buf.inner(), &begin_info)?;
@@ -406,7 +409,7 @@ impl SwapchainData {
         let ready_to_present_sems = swapchain
             .images()
             .iter()
-            .map(|_| vulkan_abstraction::Semaphore::new(Rc::clone(core)))
+            .map(|_| vulkan_abstraction::Semaphore::new(Arc::clone(core)))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok((present_barrier_cmd_bufs, ready_to_present_sems))

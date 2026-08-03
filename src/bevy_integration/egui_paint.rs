@@ -13,7 +13,7 @@
 //! between frames is safe without extra lifetime tracking.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use ash::vk;
 
@@ -57,11 +57,11 @@ pub struct EguiPaint {
     idx: Option<RawBuffer>,
     sampler: Sampler,
     pipeline: GraphicsPipeline,
-    core: Rc<Core>,
+    core: Arc<Core>,
 }
 
 impl EguiPaint {
-    pub fn new(core: Rc<Core>, color_format: vk::Format, num_images: usize) -> SrResult<Self> {
+    pub fn new(core: Arc<Core>, color_format: vk::Format, num_images: usize) -> SrResult<Self> {
         let vert = include_bytes_align_as!(u32, concat!(env!("OUT_DIR"), "/egui_vert.spirv"));
         let frag = include_bytes_align_as!(u32, concat!(env!("OUT_DIR"), "/egui_frag.spirv"));
 
@@ -87,10 +87,10 @@ impl EguiPaint {
                 .offset(16),
         ];
 
-        let pipeline = GraphicsPipeline::new_heap(Rc::clone(&core), vert, frag, color_format, binding, &attributes)?;
+        let pipeline = GraphicsPipeline::new_heap(Arc::clone(&core), vert, frag, color_format, binding, &attributes)?;
 
         let sampler = Sampler::new(
-            Rc::clone(&core),
+            Arc::clone(&core),
             vk::Filter::LINEAR,
             vk::Filter::LINEAR,
             vk::SamplerAddressMode::CLAMP_TO_EDGE,
@@ -100,7 +100,7 @@ impl EguiPaint {
         )?;
 
         let cmd_bufs = (0..num_images)
-            .map(|_| CmdBuffer::new(Rc::clone(&core)))
+            .map(|_| CmdBuffer::new(Arc::clone(&core)))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
@@ -320,7 +320,7 @@ impl EguiPaint {
 
     fn ensure_buffer(
         slot: &mut Option<RawBuffer>,
-        core: &Rc<Core>,
+        core: &Arc<Core>,
         needed: u64,
         usage: vk::BufferUsageFlags,
         name: &'static str,
@@ -330,7 +330,7 @@ impl EguiPaint {
             // Grow with headroom to avoid reallocating every few frames.
             let capacity = (needed * 2).max(4096);
             *slot = Some(RawBuffer::new_aligned(
-                Rc::clone(core),
+                Arc::clone(core),
                 capacity,
                 16,
                 gpu_allocator::MemoryLocation::CpuToGpu,
@@ -375,20 +375,22 @@ impl EguiPaint {
         Ok(())
     }
 
-    fn create_texture_image(core: &Rc<Core>, rgba: &[u8], w: usize, h: usize) -> SrResult<Image> {
+    fn create_texture_image(core: &Arc<Core>, rgba: &[u8], w: usize, h: usize) -> SrResult<Image> {
         Image::new_from_data(
-            Rc::clone(core),
+            Arc::clone(core),
             rgba.to_vec(),
-            vk::Extent3D {
-                width: w as u32,
-                height: h as u32,
-                depth: 1,
+            &crate::vulkan_abstraction::image::ImageDesc {
+                extent: vk::Extent3D {
+                    width: w as u32,
+                    height: h as u32,
+                    depth: 1,
+                },
+                format: vk::Format::R8G8B8A8_UNORM,
+                tiling: vk::ImageTiling::OPTIMAL,
+                location: gpu_allocator::MemoryLocation::GpuOnly,
+                usage: vk::ImageUsageFlags::SAMPLED,
+                name: "egui texture",
             },
-            vk::Format::R8G8B8A8_UNORM,
-            vk::ImageTiling::OPTIMAL,
-            gpu_allocator::MemoryLocation::GpuOnly,
-            vk::ImageUsageFlags::SAMPLED,
-            "egui texture",
         )
     }
 }

@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::{error::*, vulkan_abstraction};
 use ash::vk;
@@ -8,10 +8,10 @@ pub struct Queue {
     queue_family_index: u32,
     queue_index: u32,
 
-    device: Rc<vulkan_abstraction::Device>,
+    device: Arc<vulkan_abstraction::Device>,
 }
 impl Queue {
-    pub fn new(device: Rc<vulkan_abstraction::Device>, queue_index: u32, queue_family_index: u32) -> SrResult<Self> {
+    pub fn new(device: Arc<vulkan_abstraction::Device>, queue_index: u32, queue_family_index: u32) -> SrResult<Self> {
         let queue = unsafe { device.inner().get_device_queue(queue_family_index, queue_index) };
         Ok(Self {
             queue,
@@ -163,7 +163,7 @@ impl Queue {
         let cmd_buf_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer)];
         let submit_info = vk::SubmitInfo2::default().command_buffer_infos(&cmd_buf_infos);
 
-        let mut fence = vulkan_abstraction::Fence::new_unsignaled(Rc::clone(&self.device))?;
+        let mut fence = vulkan_abstraction::Fence::new_unsignaled(Arc::clone(&self.device))?;
 
         unsafe { self.device.inner().queue_submit2(self.queue, &[submit_info], fence.submit()?) }?;
         fence.wait()?;

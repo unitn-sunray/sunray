@@ -1,4 +1,4 @@
-use std::{ops::Deref, rc::Rc};
+use std::{ops::Deref, sync::Arc};
 
 use ash::vk;
 
@@ -12,7 +12,7 @@ pub struct VertexBuffer {
 
 impl VertexBuffer {
     //build a vertex buffer with flags for usage in a blas
-    pub fn new_for_blas_from_data<T: Copy>(core: Rc<vulkan_abstraction::Core>, data: &[T]) -> SrResult<Self> {
+    pub fn new_for_blas_from_data<T: Copy>(core: Arc<vulkan_abstraction::Core>, data: &[T]) -> SrResult<Self> {
         let usage_flags = vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
@@ -26,7 +26,7 @@ impl VertexBuffer {
     }
 
     //build a vertex buffer with flags for usage in a blas
-    pub fn new_for_blas<T>(core: Rc<vulkan_abstraction::Core>, len: vk::DeviceSize) -> SrResult<Self> {
+    pub fn new_for_blas<T>(core: Arc<vulkan_abstraction::Core>, len: vk::DeviceSize) -> SrResult<Self> {
         let usage_flags = vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
@@ -45,6 +45,9 @@ impl VertexBuffer {
     }
     pub fn len(&self) -> usize {
         self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
     pub fn stride(&self) -> usize {
         self.stride

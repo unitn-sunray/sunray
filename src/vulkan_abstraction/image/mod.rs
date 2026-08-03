@@ -6,9 +6,7 @@ pub use sampler::*;
 pub use texture::*;
 
 use ash::vk;
-use std::cell::Cell;
-use std::rc::Rc;
-
+use parking_lot::Mutex;
 use std::sync::Arc;
 
 use crate::render_graph::resource::RgImportable;
@@ -20,7 +18,7 @@ use vk_sync_fork as vk_sync;
 
 pub struct Image {
     //TODO rethink allocation ownership strategy
-    core: Rc<vulkan_abstraction::Core>,
+    core: Arc<vulkan_abstraction::Core>,
     image: vk::Image,
     allocation: gpu_allocator::vulkan::Allocation,
     byte_size: u64,
@@ -31,9 +29,9 @@ pub struct Image {
     view_type: vk::ImageViewType,
     /// Lazily-allocated heap slot for STORAGE_IMAGE descriptors. None until first
     /// call to `storage_slot()`.
-    storage_slot: Cell<Option<DescriptorSlot>>,
+    storage_slot: Mutex<Option<DescriptorSlot>>,
     /// Lazily-allocated heap slot for SAMPLED_IMAGE descriptors.
-    sampled_slot: Cell<Option<DescriptorSlot>>,
+    sampled_slot: Mutex<Option<DescriptorSlot>>,
     /// True when this Image holds its own `Allocation` (i.e. it was created via
     /// `Image::new`). False when memory is owned elsewhere (e.g. by a transient
     /// alias slot in `TransientResources`); in that case `Drop` still destroys
@@ -84,23 +82,29 @@ impl From<Arc<Image>> for GraphResourceImportInfo {
 }
 
 impl Image {
-    pub fn new_from_data(
-        core: Rc<vulkan_abstraction::Core>,
-        image_data: Vec<u8>,
-        extent: vk::Extent3D, //TODO we assume an extend3d but do not save the use the actual extent for any meaningful use like using the image as a vector of 2d images
-        format: vk::Format,
-        tiling: vk::ImageTiling,
-        location: gpu_allocator::MemoryLocation,
-        usage_flags: vk::ImageUsageFlags,
-        name: &'static str,
-    ) -> SrResult<Self> {
-        let usage_flags = vk::ImageUsageFlags::TRANSFER_DST | usage_flags;
+    /// Upload `image_data` into a new image described by `desc`.
+    ///
+    /// `desc.format` describes the *source data*, not the created image: the
+    /// image is always `R8G8B8A8_UNORM` and narrower source formats are widened
+    /// by [`utils::realign_data`]. `desc.extent` is assumed 3D.
+    //TODO we assume an extent3d but do not use the actual extent for anything
+    // meaningful, like treating the image as a vector of 2d images
+    pub fn new_from_data(core: Arc<vulkan_abstraction::Core>, image_data: Vec<u8>, desc: &ImageDesc) -> SrResult<Self> {
+        let usage_flags = vk::ImageUsageFlags::TRANSFER_DST | desc.usage;
 
         // format is the format of the data. we don't even try to check if it's supported by the gpu since
         // in general only RGBA8 is supported. TODO: it would be better to do so, and also we're assuming UNORM for no reason
-        let mut image = Self::new(core, extent, vk::Format::R8G8B8A8_UNORM, tiling, location, usage_flags, name)?;
+        let mut image = Self::new(
+            core,
+            desc.extent,
+            vk::Format::R8G8B8A8_UNORM,
+            desc.tiling,
+            desc.location,
+            usage_flags,
+            desc.name,
+        )?;
 
-        let image_data = match format {
+        let image_data = match desc.format {
             vk::Format::R8G8B8A8_UNORM => image_data,
             vk::Format::R8G8B8_UNORM => utils::realign_data(&image_data, 3, 4),
             vk::Format::R8G8_UNORM => utils::realign_data(&image_data, 2, 4),
@@ -108,7 +112,7 @@ impl Image {
             _ => todo!(), // TODO
         };
 
-        let staging_buffer = vulkan_abstraction::StagingBuffer::new_temp_from_data(Rc::clone(&image.core), &image_data)?;
+        let staging_buffer = vulkan_abstraction::StagingBuffer::new_temp_from_data(Arc::clone(&image.core), &image_data)?;
 
         image.copy_from_buffer(&staging_buffer)?;
 
@@ -117,7 +121,7 @@ impl Image {
     /// Construct an image from a render-graph descriptor. Equivalent to calling
     /// `Image::new` with the desc's fields; kept as a separate entry point so the
     /// graph can build images straight from a `&ImageDesc` without unpacking.
-    pub fn new_from_desc(core: Rc<vulkan_abstraction::Core>, desc: &ImageDesc) -> SrResult<Self> {
+    pub fn new_from_desc(core: Arc<vulkan_abstraction::Core>, desc: &ImageDesc) -> SrResult<Self> {
         Self::new(
             core,
             desc.extent,
@@ -130,7 +134,7 @@ impl Image {
     }
 
     pub fn new(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         extent: vk::Extent3D,
         format: vk::Format,
         tiling: vk::ImageTiling,
@@ -205,8 +209,8 @@ impl Image {
             extent,
             format,
             view_type,
-            storage_slot: Cell::new(None),
-            sampled_slot: Cell::new(None),
+            storage_slot: Mutex::new(None),
+            sampled_slot: Mutex::new(None),
             owns_memory: true,
             owns_image: true,
         })
@@ -244,7 +248,7 @@ impl Image {
     /// view; `Drop` will destroy the handle + view but NOT free the memory. Used
     /// for transient images that share a slot allocation in `TransientResources`.
     pub(crate) fn from_aliased(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         image: vk::Image,
         extent: vk::Extent3D,
         format: vk::Format,
@@ -275,8 +279,8 @@ impl Image {
             extent,
             format,
             view_type,
-            storage_slot: Cell::new(None),
-            sampled_slot: Cell::new(None),
+            storage_slot: Mutex::new(None),
+            sampled_slot: Mutex::new(None),
             owns_memory: false,
             owns_image: true,
         })
@@ -288,7 +292,7 @@ impl Image {
     /// operate on the raw image, not a view). Used by the render graph's present
     /// pass to blit the post-process result into the acquired swapchain image.
     pub fn from_swapchain_image(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         image: vk::Image,
         extent: vk::Extent3D,
         format: vk::Format,
@@ -309,8 +313,8 @@ impl Image {
             extent,
             format,
             view_type: vk::ImageViewType::TYPE_2D,
-            storage_slot: Cell::new(None),
-            sampled_slot: Cell::new(None),
+            storage_slot: Mutex::new(None),
+            sampled_slot: Mutex::new(None),
             owns_memory: false,
             owns_image: false,
         }
@@ -422,24 +426,24 @@ impl Image {
     /// Heap slot for `STORAGE_IMAGE`. Allocated and written on first call; cached for the
     /// rest of the image's life. Layout used in the descriptor is `GENERAL`.
     pub fn storage_slot(&self) -> u32 {
-        if let Some(s) = self.storage_slot.get() {
+        if let Some(s) = *self.storage_slot.lock() {
             return s.shader_index();
         }
         let slot = self.write_image_slot(ResourceDescriptorKind::StorageImage, vk::ImageLayout::GENERAL);
-        self.storage_slot.set(Some(slot));
+        *self.storage_slot.lock() = Some(slot);
         slot.shader_index()
     }
 
     /// Heap slot for `SAMPLED_IMAGE`. Layout used in the descriptor is `SHADER_READ_ONLY_OPTIMAL`.
     pub fn sampled_slot(&self) -> u32 {
-        if let Some(s) = self.sampled_slot.get() {
+        if let Some(s) = *self.sampled_slot.lock() {
             return s.shader_index();
         }
         let slot = self.write_image_slot(
             ResourceDescriptorKind::SampledImage,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         );
-        self.sampled_slot.set(Some(slot));
+        *self.sampled_slot.lock() = Some(slot);
         slot.shader_index()
     }
 
@@ -484,10 +488,10 @@ impl Drop for Image {
         // Return any descriptor slots we allocated.
         {
             let mut heap = self.core.descriptor_heap_mut();
-            if let Some(s) = self.storage_slot.get() {
+            if let Some(s) = *self.storage_slot.lock() {
                 heap.free(s);
             }
-            if let Some(s) = self.sampled_slot.get() {
+            if let Some(s) = *self.sampled_slot.lock() {
                 heap.free(s);
             }
         }

@@ -4,7 +4,7 @@
 //! - [`SunrayWindows`] / [`ExtractedCamera`] / [`ExtractedScene`] — plain Send
 //!   snapshots written by the extract systems.
 //! - [`SunrayRenderState`] — the renderer + window-bound GPU objects. It is a
-//!   **NonSend** resource because [`crate::Renderer`] is `Rc`-based (`!Send`);
+//!   **NonSend** resource because [`crate::Renderer`] is `Arc`-based (`!Send`);
 //!   the single-threaded render SubApp guarantees it's only touched on the main
 //!   thread (see `docs/bevy_integration.md`).
 //!

@@ -149,16 +149,18 @@ fn ensure_renderer_impl(state: &mut SunrayRenderState, windows: &SunrayWindows, 
     // (Re)load — or unload, when the request's path is `None` — the scene once
     // the renderer exists. The instance list the load returns is kept here
     // (caller side) and passed to the renderer each frame.
-    if state.renderer.is_some() && scene.generation != state.loaded_scene_generation {
+    if scene.generation != state.loaded_scene_generation
+        && let Some(renderer) = state.renderer.as_mut()
+    {
         // Free the previous scene's assets so reloading/unloading doesn't leak.
         if let Some(prev_group) = state.scene_group.take() {
             state.scene_instances.clear();
             state.scene_blas_keys.clear();
-            state.renderer.as_mut().unwrap().unload_scene(prev_group)?;
+            renderer.unload_scene(prev_group)?;
             log::info!("sunray: unloaded previous scene (group {prev_group})");
         }
         if let Some(path) = scene.gltf_path.clone() {
-            match state.renderer.as_mut().unwrap().load_gltf(&path) {
+            match renderer.load_gltf(&path) {
                 Ok((group, instances)) => {
                     log::info!("sunray: loaded {} unique BLASes from {path}", instances.len());
                     state.scene_group = Some(group);

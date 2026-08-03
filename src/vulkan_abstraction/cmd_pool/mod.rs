@@ -7,16 +7,16 @@ use crate::vulkan_abstraction;
 
 use ash::vk;
 use std::ops::Deref;
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub struct CmdPool {
     cmd_pool: vk::CommandPool,
-    device: Rc<vulkan_abstraction::Device>,
+    device: Arc<vulkan_abstraction::Device>,
 }
 
 impl CmdPool {
     pub fn new(
-        device: Rc<vulkan_abstraction::Device>,
+        device: Arc<vulkan_abstraction::Device>,
         queue_family_index: u32,
         flags: vk::CommandPoolCreateFlags,
     ) -> SrResult<Self> {

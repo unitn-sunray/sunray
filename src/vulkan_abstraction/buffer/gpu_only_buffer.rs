@@ -3,7 +3,6 @@ use crate::vulkan_abstraction;
 use crate::vulkan_abstraction::{Buffer, BufferDesc};
 use crate::vulkan_abstraction::{RawBuffer, StagingBuffer};
 use ash::vk;
-use std::rc::Rc;
 use std::sync::Arc;
 
 pub struct GpuOnlyBuffer {
@@ -13,7 +12,7 @@ crate::impl_buffer_trait!(GpuOnlyBuffer);
 
 impl GpuOnlyBuffer {
     pub fn new<T>(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         len: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
         name: &'static str,
@@ -32,7 +31,7 @@ impl GpuOnlyBuffer {
     }
 
     pub fn new_aligned<T>(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         len: vk::DeviceSize,
         alignment: u64,
         usage: vk::BufferUsageFlags,
@@ -54,8 +53,13 @@ impl GpuOnlyBuffer {
         (self.raw.byte_size as usize) / std::mem::size_of::<T>()
     }
 
+    /// Element-type-independent: a zero-byte buffer holds zero of anything.
+    pub fn is_empty(&self) -> bool {
+        self.raw.byte_size == 0
+    }
+
     pub fn new_from_data<T>(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         data: &[T],
         buffer_usage_flags: vk::BufferUsageFlags,
         name: &'static str,
@@ -67,7 +71,7 @@ impl GpuOnlyBuffer {
             return Ok(Self::new_null(core));
         }
 
-        let staging_buffer = StagingBuffer::new_temp_from_data(Rc::clone(&core), data)?;
+        let staging_buffer = StagingBuffer::new_temp_from_data(Arc::clone(&core), data)?;
         let gpu_buffer =
             staging_buffer.new_cloned_to_gpu_only_buffer(buffer_usage_flags | vk::BufferUsageFlags::TRANSFER_DST, name)?;
 

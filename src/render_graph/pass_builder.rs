@@ -65,7 +65,7 @@ impl PassCommonDataBuilder {
     /// Attach the recording closure to this pass. Replaces any previous one.
     pub fn render<F>(&mut self, f: F) -> &mut Self
     where
-        F: FnMut(&mut CommandBuffer, &TransientResources) -> SrResult<()> + 'static,
+        F: FnMut(&mut CommandBuffer, &TransientResources) -> SrResult<()> + Send + 'static,
     {
         self.pass_common_data.render = Some(Box::new(f));
         self
@@ -285,7 +285,7 @@ impl RaytracingRenderPassBuilder {
     /// the graph emits the barrier — no manual barrier in the closure.
     pub fn generate_render<F>(mut self, rg: &mut RenderGraph, push: F) -> SrResult<Self>
     where
-        F: Fn(&TransientResources) -> SrResult<Vec<u8>> + 'static,
+        F: Fn(&TransientResources) -> SrResult<Vec<u8>> + Send + 'static,
     {
         const CTX: &str = "RaytracingRenderPassBuilder::generate_render";
 
@@ -430,7 +430,7 @@ impl RasterRenderPassBuilder {
     #[allow(dead_code)]
     pub fn generate_render<F>(mut self, rg: &mut RenderGraph, push: F) -> SrResult<Self>
     where
-        F: Fn(&TransientResources) -> SrResult<Vec<u8>> + 'static,
+        F: Fn(&TransientResources) -> SrResult<Vec<u8>> + Send + 'static,
     {
         const CTX: &str = "RasterRenderPassBuilder::generate_render";
 
@@ -774,7 +774,7 @@ impl ComputeRenderPassBuilder {
         mut self,
         rg: &mut RenderGraph,
         dispatch: [u32; 3],
-        get_push_data: impl Fn(&TransientResources) -> SrResult<PushConstType> + 'static,
+        get_push_data: impl Fn(&TransientResources) -> SrResult<PushConstType> + Send + 'static,
     ) -> SrResult<ComputeRenderPass> {
         const CTX: &str = "ComputeRenderPassBuilder::generate_render";
 
@@ -861,4 +861,4 @@ pub enum ShaderSource {
     Spirv(Vec<u8>),
 }
 
-pub(crate) type DynRenderFn = dyn FnMut(&mut CommandBuffer, &TransientResources) -> SrResult<()>;
+pub(crate) type DynRenderFn = dyn FnMut(&mut CommandBuffer, &TransientResources) -> SrResult<()> + Send;

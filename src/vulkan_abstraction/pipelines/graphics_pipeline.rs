@@ -1,5 +1,5 @@
 use std::ffi::CStr;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use ash::vk;
 use ash::vk::TaggedStructure;
@@ -35,13 +35,13 @@ pub struct GraphicsPipelineShaders {
 /// attachment supplied via dynamic rendering. The caller provides the vertex
 /// layout and the color-attachment format.
 pub struct GraphicsPipeline {
-    core: Rc<Core>,
+    core: Arc<Core>,
     pipeline: vk::Pipeline,
 }
 
 impl GraphicsPipeline {
     pub fn new_heap(
-        core: Rc<Core>,
+        core: Arc<Core>,
         vertex_spirv: &[u8],
         fragment_spirv: &[u8],
         color_format: vk::Format,
@@ -150,7 +150,7 @@ impl GraphicsPipeline {
 impl Pipeline for GraphicsPipeline {
     type Shaders = GraphicsPipelineShaders;
 
-    fn new(core: Rc<Core>, shaders: &Self::Shaders) -> SrResult<Self> {
+    fn new(core: Arc<Core>, shaders: &Self::Shaders) -> SrResult<Self> {
         Self::new_heap(
             core,
             &shaders.vertex,

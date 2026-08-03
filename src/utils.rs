@@ -80,9 +80,7 @@ pub(crate) fn realign_data(bytes: &[u8], starting_alignment: usize, target_align
         for j in 0..starting_alignment.min(target_alignment) {
             ret.push(bytes[i * starting_alignment + j]);
         }
-        for _ in starting_alignment..target_alignment {
-            ret.push(0x00);
-        }
+        ret.extend(std::iter::repeat_n(0x00, target_alignment.saturating_sub(starting_alignment)));
 
         i += 1;
     }
@@ -110,6 +108,15 @@ macro_rules! include_bytes_align_as {
 
         &ALIGNED.bytes
     }};
+}
+
+pub fn na_mat4_to_vk_transform(m: nalgebra::Matrix4<f32>) -> vk::TransformMatrixKHR {
+    // VkTransformMatrixKHR is a row-major 3x4 affine, flattened to [f32; 12].
+    vk::TransformMatrixKHR {
+        matrix: [
+            m.m11, m.m12, m.m13, m.m14, m.m21, m.m22, m.m23, m.m24, m.m31, m.m32, m.m33, m.m34,
+        ],
+    }
 }
 
 #[cfg(test)]
@@ -142,14 +149,5 @@ mod tests {
         assert_eq!(graph_dump_dir(), None);
         unsafe { std::env::remove_var(GRAPH_DUMP_DIR) };
         assert_eq!(graph_dump_dir(), None);
-    }
-}
-
-pub fn na_mat4_to_vk_transform(m: nalgebra::Matrix4<f32>) -> vk::TransformMatrixKHR {
-    // VkTransformMatrixKHR is a row-major 3x4 affine, flattened to [f32; 12].
-    vk::TransformMatrixKHR {
-        matrix: [
-            m.m11, m.m12, m.m13, m.m14, m.m21, m.m22, m.m23, m.m24, m.m31, m.m32, m.m33, m.m34,
-        ],
     }
 }

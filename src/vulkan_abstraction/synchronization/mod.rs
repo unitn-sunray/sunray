@@ -26,6 +26,11 @@ pub use fence::*;
 pub use semaphore::*;
 
 /// # Creates a memory barrier (sync2)
+///
+/// # Safety
+/// `cmd_buf` must be a live command buffer in the recording state, owned by a
+/// pool this thread has exclusive access to, and the barriers must name only
+/// resources still alive for the whole submission.
 pub unsafe fn cmd_memory_barrier(
     core: &vulkan_abstraction::Core,
     cmd_buf: vk::CommandBuffer,
@@ -44,6 +49,13 @@ pub unsafe fn cmd_memory_barrier(
 }
 
 /// # Creates an image memory barrier (sync2)
+///
+/// # Safety
+/// Same contract as [`cmd_memory_barrier`], plus `image` must outlive the
+/// submission and `old_layout` must match the layout the image is actually in.
+// The parameter list mirrors `VkImageMemoryBarrier2` field for field; grouping it
+// into a struct would just re-create the ash builder that already exists.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn cmd_image_memory_barrier(
     core: &vulkan_abstraction::Core,
     cmd_buf: vk::CommandBuffer,

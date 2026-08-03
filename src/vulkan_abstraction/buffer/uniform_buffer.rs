@@ -4,16 +4,18 @@ use crate::vulkan_abstraction::{HostAccessibleBuffer, RawBuffer};
 use crate::{impl_buffer_trait, vulkan_abstraction};
 use ash::vk;
 use std::marker::PhantomData;
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub struct UniformBuffer<T> {
     raw: RawBuffer,
-    _marker: PhantomData<T>,
+    // `fn() -> T` rather than `T`: this is a type tag for a byte buffer, and the
+    // plain form would make the buffer non-`Send` for any non-`Send` `T`.
+    _marker: PhantomData<fn() -> T>,
 }
 impl_buffer_trait!(UniformBuffer<T>);
 
 impl<T> UniformBuffer<T> {
-    pub fn new(core: Rc<vulkan_abstraction::Core>, len: vk::DeviceSize) -> SrResult<Self> {
+    pub fn new(core: Arc<vulkan_abstraction::Core>, len: vk::DeviceSize) -> SrResult<Self> {
         let byte_size = len * std::mem::size_of::<T>() as vk::DeviceSize;
         let raw = RawBuffer::new_aligned(
             core,

@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use ash::vk;
 use ash::vk::TaggedStructure;
@@ -6,12 +6,12 @@ use ash::vk::TaggedStructure;
 use crate::{error::SrResult, vulkan_abstraction};
 
 pub struct Semaphore {
-    core: Rc<vulkan_abstraction::Core>,
+    core: Arc<vulkan_abstraction::Core>,
     handle: vk::Semaphore,
 }
 
 impl Semaphore {
-    pub fn new(core: Rc<vulkan_abstraction::Core>) -> SrResult<Self> {
+    pub fn new(core: Arc<vulkan_abstraction::Core>) -> SrResult<Self> {
         let handle = unsafe {
             core.device().inner().create_semaphore(
                 &vk::SemaphoreCreateInfo::default()
@@ -42,12 +42,12 @@ impl Drop for Semaphore {
 /// so "wait for frame N" is `wait(N)` and the counter value is the last
 /// finished frame — no per-frame fences to track or recycle.
 pub struct TimelineSemaphore {
-    core: Rc<vulkan_abstraction::Core>,
+    core: Arc<vulkan_abstraction::Core>,
     handle: vk::Semaphore,
 }
 
 impl TimelineSemaphore {
-    pub fn new(core: Rc<vulkan_abstraction::Core>, initial_value: u64) -> SrResult<Self> {
+    pub fn new(core: Arc<vulkan_abstraction::Core>, initial_value: u64) -> SrResult<Self> {
         let mut type_info = vk::SemaphoreTypeCreateInfo::default()
             .semaphore_type(vk::SemaphoreType::TIMELINE)
             .initial_value(initial_value);

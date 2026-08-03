@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::error::*;
 use crate::vulkan_abstraction;
@@ -19,13 +19,13 @@ use ash::vk;
 ///    submit it, and drop the pre-compaction structure once that submission
 ///    completes.
 pub struct CompactionQueryPool {
-    core: Rc<vulkan_abstraction::Core>,
+    core: Arc<vulkan_abstraction::Core>,
     pool: vk::QueryPool,
     capacity: u32,
 }
 
 impl CompactionQueryPool {
-    pub fn new(core: Rc<vulkan_abstraction::Core>, capacity: u32) -> SrResult<Self> {
+    pub fn new(core: Arc<vulkan_abstraction::Core>, capacity: u32) -> SrResult<Self> {
         let create_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR)
             .query_count(capacity);

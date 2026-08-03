@@ -3,7 +3,7 @@ use crate::vulkan_abstraction::{Core, Device};
 use ash::vk;
 use ash::vk::TaggedStructure;
 use std::marker::PhantomData;
-use std::{ffi::CStr, rc::Rc};
+use std::{ffi::CStr, sync::Arc};
 
 const SHADER_ENTRY_POINT: &CStr = c"main";
 
@@ -126,7 +126,7 @@ pub struct PostprocessPushConstant {
     pub exposure: f32,
 }
 pub struct ComputePipeline<PushConstType> {
-    device: Rc<Device>,
+    device: Arc<Device>,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     _marker: PhantomData<PushConstType>,
@@ -141,14 +141,14 @@ pub struct ComputePipeline<PushConstType> {
 /// per-pipeline bundle of SPIR-V blobs (plus, for graphics, the fixed-function
 /// vertex/format inputs) the constructor needs.
 ///
-/// `new` takes `Rc<Core>` rather than a bare `ash::Device` because the
+/// `new` takes `Arc<Core>` rather than a bare `ash::Device` because the
 /// ray-tracing pipeline needs the `VK_KHR_ray_tracing_pipeline` device wrapper
 /// (and every pipeline holds a `Core`/`Device` for `Drop`); compute derives the
 /// device from it.
 pub trait Pipeline {
     type Shaders;
 
-    fn new(device: Rc<Core>, shaders: &Self::Shaders) -> SrResult<Self>
+    fn new(device: Arc<Core>, shaders: &Self::Shaders) -> SrResult<Self>
     where
         Self: Sized;
 
@@ -167,7 +167,7 @@ impl<PushConstType> ComputePipeline<PushConstType> {
     /// the pipeline itself is flagged `DESCRIPTOR_HEAP_EXT`. Caller supplies the SPIR-V
     /// directly (e.g. from the Slang `ShaderCompiler`) since heap-mode shaders are not
     /// the build-time-baked GLSL ones referenced by `T::spirv_bytes`.
-    pub fn new(device: Rc<Device>, spirv_bytes: &[u8]) -> SrResult<Self> {
+    pub fn new(device: Arc<Device>, spirv_bytes: &[u8]) -> SrResult<Self> {
         let spirv_u32 = bytemuck::cast_slice(spirv_bytes);
 
         let module_create_info = vk::ShaderModuleCreateInfo::default().code(spirv_u32);
@@ -213,7 +213,7 @@ impl<PushConstType> ComputePipeline<PushConstType> {
 impl<PushConstType> Pipeline for ComputePipeline<PushConstType> {
     type Shaders = ComputePipelineShaders;
 
-    fn new(core: Rc<Core>, shaders: &Self::Shaders) -> SrResult<Self> {
+    fn new(core: Arc<Core>, shaders: &Self::Shaders) -> SrResult<Self> {
         Self::new(core.clone_device(), &shaders.compute_spirv)
     }
 

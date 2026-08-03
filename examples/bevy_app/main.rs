@@ -24,6 +24,10 @@
 //! - **bevy** — Bevy's asset pipeline (`bevy_gltf` via [`SunrayGltfScene`]);
 //!   async, additive (several scenes can stack), factor-only materials.
 
+// A Bevy system's parameter list is its ECS dependency declaration; see the
+// same allow in src/bevy_integration/mod.rs.
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::HashMap;
 
 use bevy_a11y::AccessibilityPlugin;

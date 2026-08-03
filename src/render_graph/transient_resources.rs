@@ -11,7 +11,6 @@ use crate::vulkan_abstraction::{
 };
 use ash::vk;
 use std::collections::{BTreeMap, HashMap};
-use std::rc::Rc;
 use std::sync::Arc;
 use vk_sync_fork as vk_sync;
 
@@ -42,7 +41,7 @@ pub struct TransientResources {
     /// commands are already recorded into the command buffer at this point.
     pub(crate) recorded_barriers: Vec<(usize, Vec<ResourceBarrier>)>,
     /// Cached for `Drop`. Set on first `populate`.
-    core: Option<Rc<Core>>,
+    core: Option<Arc<Core>>,
     /// Persistent pipeline cache. Unlike every other field here it is **not**
     /// cleared by `free_internal_state`: passes are rebuilt each frame but their
     /// pipelines are interned once and reused (see [`PipelineCache`]).
@@ -111,7 +110,7 @@ impl TransientResources {
     ///     can be replayed each frame without re-allocating.
     pub(crate) fn populate(
         &mut self,
-        core: Rc<Core>,
+        core: Arc<Core>,
         virtual_resources: &[GraphResourceInfo],
         components: &[PassComponent],
         usages: &BTreeMap<u32, ResourceLifetimeUsage>,
@@ -122,7 +121,7 @@ impl TransientResources {
         // TODO: detect that desc+lifetimes haven't changed and keep `slot_allocations`
         //       alive across populate calls so we don't churn the allocator each frame.
         self.free_internal_state();
-        self.core = Some(Rc::clone(&core));
+        self.core = Some(Arc::clone(&core));
 
         // ---------- Phase 1: create unbound handles + collect memory requirements. ----------
         // Sampler / AS are handled separately because they don't participate in slot aliasing.
@@ -165,7 +164,7 @@ impl TransientResources {
                 GraphResourceDesc::Sampler(sampler_desc) => {
                     // Samplers aren't aliased. Build the wrapper and (eagerly) reserve
                     // its descriptor heap slot.
-                    let sampler = Sampler::new_from_desc(Rc::clone(&core), sampler_desc)?;
+                    let sampler = Sampler::new_from_desc(Arc::clone(&core), sampler_desc)?;
                     // TODO: this descriptor pre-assignment exists for the legacy single-
                     //       slot-per-resource model; the heap rework will replace it.
                     let _ = sampler.slot();
@@ -285,7 +284,7 @@ impl TransientResources {
                     if name_objects && let Ok(cname) = std::ffi::CString::new(desc.name) {
                         core.set_debug_object_name(handle, &cname);
                     }
-                    let image = Image::from_aliased(Rc::clone(&core), handle, desc.extent, desc.format, reqs.size)?;
+                    let image = Image::from_aliased(Arc::clone(&core), handle, desc.extent, desc.format, reqs.size)?;
                     // TODO: this descriptor pre-assignment exists for the legacy single-
                     //       slot-per-resource model; the heap rework will replace it.
                     if desc.usage.contains(vk::ImageUsageFlags::STORAGE) {
@@ -301,7 +300,7 @@ impl TransientResources {
                     if name_objects && let Ok(cname) = std::ffi::CString::new(desc.name) {
                         core.set_debug_object_name(handle, &cname);
                     }
-                    let buffer = RawBuffer::from_aliased(Rc::clone(&core), handle, desc.byte_size, desc.usage)?;
+                    let buffer = RawBuffer::from_aliased(Arc::clone(&core), handle, desc.byte_size, desc.usage)?;
                     // TODO: same legacy-descriptor caveat as the image path above.
                     if desc.usage.contains(vk::BufferUsageFlags::STORAGE_BUFFER) {
                         let _ = buffer.storage_slot();

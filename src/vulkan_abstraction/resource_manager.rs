@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use ash::vk;
 
@@ -28,7 +28,7 @@ enum ArenaId {
 
 /// Deferred work executed at the start of a specific absolute frame (see
 /// [`ResourceManager::start_of_frame`]).
-type FrameCallback<K> = Box<dyn FnOnce(&mut ResourceManager<K>) -> SrResult<()>>;
+type FrameCallback<K> = Box<dyn FnOnce(&mut ResourceManager<K>) -> SrResult<()> + Send>;
 
 /// The raw per-frame data resolved from the caller's `(key, transforms)`
 /// instance list. The renderer uploads these into CpuToGpu buffers created on
@@ -87,12 +87,12 @@ pub(crate) struct ResourceManager<K: Hash + Eq + Copy> {
     /// pending.
     pending_blas_builds: Vec<(K, AsBuildJob)>,
 
-    core: Rc<vulkan_abstraction::Core>,
+    core: Arc<vulkan_abstraction::Core>,
 }
 
 // `K: 'static` because deferred frame work is stored as boxed `FnOnce(&mut Self)`.
-impl<K: Hash + Eq + Copy + 'static> ResourceManager<K> {
-    pub fn new_empty(core: Rc<vulkan_abstraction::Core>) -> SrResult<Self> {
+impl<K: Hash + Eq + Copy + Send + 'static> ResourceManager<K> {
+    pub fn new_empty(core: Arc<vulkan_abstraction::Core>) -> SrResult<Self> {
         // SHADER_DEVICE_ADDRESS so the heap path can compute the buffer's BDA
         // when allocating a storage-buffer descriptor (`Buffer::storage_slot`
         // internally calls `vkGetBufferDeviceAddress`).
@@ -118,7 +118,7 @@ impl<K: Hash + Eq + Copy + 'static> ResourceManager<K> {
         // build is synchronous, so dropping it right after is fine). Per-frame
         // instance buffers are created by the renderer each frame.
         let empty_instances_buffer = vulkan_abstraction::StagingBuffer::<vk::AccelerationStructureInstanceKHR>::new(
-            Rc::clone(&core),
+            Arc::clone(&core),
             1,
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
@@ -130,14 +130,14 @@ impl<K: Hash + Eq + Copy + 'static> ResourceManager<K> {
         // non-null). `SometimesChanges` == the pre-rework
         // `PREFER_FAST_TRACE | ALLOW_UPDATE` TLAS flags.
         let tlas = vulkan_abstraction::Tlas::new(
-            Rc::clone(&core),
+            Arc::clone(&core),
             &empty_instances_buffer,
             0,
             vulkan_abstraction::BuildType::SometimesChanges,
         )?;
 
         let default_sampler = vulkan_abstraction::Sampler::new(
-            Rc::clone(&core),
+            Arc::clone(&core),
             vk::Filter::LINEAR,
             vk::Filter::LINEAR,
             vk::SamplerAddressMode::CLAMP_TO_EDGE,
@@ -169,12 +169,12 @@ impl<K: Hash + Eq + Copy + 'static> ResourceManager<K> {
 
     /// Absolute frame number the next rendered frame will carry.
     fn next_frame(&self) -> u64 {
-        *self.core.absolute_frame_count.borrow() as u64 + 1
+        self.core.absolute_frame_count() as u64 + 1
     }
 
     /// Schedule `callback` to run at the start of frame `frame` (or the first
     /// `start_of_frame` call at/after it).
-    fn schedule_at_frame(&mut self, frame: u64, callback: impl FnOnce(&mut Self) -> SrResult<()> + 'static) {
+    fn schedule_at_frame(&mut self, frame: u64, callback: impl FnOnce(&mut Self) -> SrResult<()> + Send + 'static) {
         self.start_of_frame_callbacks.push((frame, Box::new(callback)));
     }
 
@@ -532,7 +532,7 @@ impl<K: Hash + Eq + Copy + 'static> ResourceManager<K> {
         if let Some(sampler) = self.samplers.get(desc) {
             return Ok(sampler.slot());
         }
-        let sampler = vulkan_abstraction::Sampler::new_from_desc(Rc::clone(&self.core), desc)?;
+        let sampler = vulkan_abstraction::Sampler::new_from_desc(Arc::clone(&self.core), desc)?;
         let slot = sampler.slot();
         self.samplers.insert(desc.clone(), sampler);
         Ok(slot)

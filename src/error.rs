@@ -47,10 +47,8 @@ impl SrError {
 
 impl From<gltf::Error> for SrError {
     fn from(value: gltf::Error) -> Self {
-        let description = match &value {
-            //TODO: provide description for some errors
-            e => format!("UNEXPECTED GLTF ERROR: {e}"),
-        };
+        //TODO: provide description for some errors
+        let description = format!("UNEXPECTED GLTF ERROR: {value}");
 
         Self::new(ErrorSource::Gltf(value), description)
     }
@@ -58,10 +56,8 @@ impl From<gltf::Error> for SrError {
 
 impl From<vk::Result> for SrError {
     fn from(value: vk::Result) -> Self {
-        let description = match value {
-            //TODO: provide description for some errors
-            e => format!("UNEXPECTED VULKAN ERROR: {e}"),
-        };
+        //TODO: provide description for some errors
+        let description = format!("UNEXPECTED VULKAN ERROR: {value}");
 
         Self::new(ErrorSource::Vulkan(value), description)
     }

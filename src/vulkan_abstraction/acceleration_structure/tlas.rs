@@ -4,7 +4,6 @@ use crate::vulkan_abstraction::acceleration_structure::{AsState, BuildType, OpTy
 use crate::vulkan_abstraction::descriptor_heap::{DescriptorSlot, ResourceDescriptorKind};
 use crate::vulkan_abstraction::{AccelerationStructure, AsBuildInputs, AsBuildJob, Buffer};
 use ash::vk;
-use std::rc::Rc;
 use std::sync::Arc;
 // Resources:
 // - https://github.com/adrien-ben/vulkan-examples-rs
@@ -43,13 +42,13 @@ impl Tlas {
     /// Build a TLAS over the `instance_count` instances already written into
     /// `instances_buffer`
     pub fn new(
-        core: Rc<vulkan_abstraction::Core>,
+        core: Arc<vulkan_abstraction::Core>,
         instances_buffer: &impl Buffer,
         instance_count: u32,
         build_type: BuildType,
     ) -> SrResult<Self> {
         let accel = Arc::new(AccelerationStructure::build_sync(
-            Rc::clone(&core),
+            Arc::clone(&core),
             Self::make_inputs(instances_buffer, instance_count, build_type),
         )?);
 
@@ -97,7 +96,7 @@ impl Tlas {
     /// idle before this, so no in-flight frame still references it.
     pub fn rebuild_from_buffer(&mut self, instance_count: u32, instances_buffer: &impl Buffer) -> SrResult<()> {
         let accel = AccelerationStructure::build_sync(
-            Rc::clone(self.accel.core()),
+            Arc::clone(self.accel.core()),
             Self::make_inputs(instances_buffer, instance_count, self.build_type),
         )?;
 
@@ -176,7 +175,7 @@ impl Tlas {
         let job = match op {
             OpType::Update => self.accel.update(inputs)?,
             OpType::FastBuild | OpType::SlowBuild => {
-                let (new_accel, job) = AccelerationStructure::build(Rc::clone(self.accel.core()), inputs)?;
+                let (new_accel, job) = AccelerationStructure::build(Arc::clone(self.accel.core()), inputs)?;
                 // Previous-frame's graph import of the old structure was dropped by
                 // `RenderGraph::reset`, and its submission has completed, so swapping
                 // (and dropping the old `Arc`) here is safe.

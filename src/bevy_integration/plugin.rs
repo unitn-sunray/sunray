@@ -19,7 +19,7 @@ use super::state::{ExtractedCamera, ExtractedInstances, ExtractedScene, SunrayRe
 use super::systems::{ensure_renderer, extract_camera, extract_instances, extract_scene, extract_windows, render_frame};
 
 /// Add this instead of `bevy_render::RenderPlugin` (and without
-/// `PipelinedRenderingPlugin` — the renderer is `Rc`-based and runs
+/// `PipelinedRenderingPlugin` — the renderer is `Arc`-based and runs
 /// single-threaded; see `docs/bevy_integration.md`).
 pub struct SunrayRenderPlugin {
     /// Format passed to `Renderer::new_with_surface`. Mainly controls the
@@ -70,7 +70,7 @@ impl Plugin for SunrayRenderPlugin {
         render_app.init_resource::<ExtractedInstances>();
         render_app.init_resource::<ExtractedMeshAssets>();
 
-        // The renderer itself is NonSend (Rc-based). Seed it with the chosen format.
+        // The renderer itself is NonSend (Arc-based). Seed it with the chosen format.
         render_app.world_mut().insert_non_send(SunrayRenderState {
             image_format: self.image_format,
             ..Default::default()

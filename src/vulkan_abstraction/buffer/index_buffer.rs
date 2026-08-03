@@ -1,4 +1,4 @@
-use std::{any::TypeId, ops::Deref, rc::Rc};
+use std::{any::TypeId, ops::Deref, sync::Arc};
 
 use ash::vk;
 
@@ -13,7 +13,7 @@ pub struct IndexBuffer {
 }
 impl IndexBuffer {
     //build an index buffer with flags for usage in a blas
-    pub fn new_for_blas_from_data<T>(core: Rc<vulkan_abstraction::Core>, data: &[T]) -> SrResult<Self>
+    pub fn new_for_blas_from_data<T>(core: Arc<vulkan_abstraction::Core>, data: &[T]) -> SrResult<Self>
     where
         T: 'static + Copy,
     {
@@ -38,7 +38,7 @@ impl IndexBuffer {
             idx_type,
         })
     }
-    pub fn new_for_blas<T>(core: Rc<vulkan_abstraction::Core>, len: vk::DeviceSize) -> SrResult<Self>
+    pub fn new_for_blas<T>(core: Arc<vulkan_abstraction::Core>, len: vk::DeviceSize) -> SrResult<Self>
     where
         T: 'static,
     {
@@ -70,6 +70,9 @@ impl IndexBuffer {
     }
     pub fn len(&self) -> usize {
         self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
     pub fn index_type(&self) -> vk::IndexType {
         self.idx_type
