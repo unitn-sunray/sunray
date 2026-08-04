@@ -1,12 +1,13 @@
 use crate::MAX_FRAMES_IN_FLIGHT;
 use crate::error::{ErrorSource, SrError, SrResult};
+use crate::render_graph::alias::Placement;
 use crate::render_graph::error::GraphError;
 use crate::render_graph::pass_builder::{
     ComputeQueueAffinity, ComputeRenderPass, CopyEnd, InternalPass, PassCommonData, PassCommonDataBuilder, RasterRenderPass,
     RaytracingRenderPass, TransferPass, TransferPassBuilder, check_copy_bounds,
 };
 pub(crate) use crate::render_graph::resource::{
-    GraphResourceDesc, GraphResourceImportInfo, GraphResourceInfo, Handle, Resource, ResourceDesc, RgImportable,
+    GraphResourceDesc, GraphResourceImportInfo, GraphResourceInfo, Handle, Resource, ResourceDesc, ResourceRef, RgImportable,
 };
 use crate::render_graph::transient_resources::{TransientResources, image_layout_of};
 use crate::vulkan_abstraction::{
@@ -306,6 +307,121 @@ fn record_usage(usages: &mut BTreeMap<u32, ResourceLifetimeUsage>, res_id: u32, 
         });
 }
 
+/// Everything the hazard scan derives from a pass list: per-resource lifetimes,
+/// the pass dependency graph, and the weakly-connected components that aliasing is
+/// computed within.
+pub(crate) struct PassAnalysis {
+    pub(crate) resource_usages: BTreeMap<u32, ResourceLifetimeUsage>,
+    pub(crate) dep_graph: petgraph::graph::DiGraph<usize, PassDependency>,
+    pub(crate) components: Vec<PassComponent>,
+}
+
+/// Single linear walk over the passes in declaration order, building lifetimes and
+/// hazard edges, then the components those edges induce.
+///
+/// Split out of `compile` so it can be driven from plain `(read, write)` lists —
+/// `bench_support::gen_graph` feeds it random pass declarations, which means the
+/// random benchmarks exercise this scan rather than a reimplementation of it.
+pub(crate) fn analyze_passes<'a>(passes: impl ExactSizeIterator<Item = (&'a [ResourceRef], &'a [ResourceRef])>) -> PassAnalysis {
+    let pass_count = passes.len();
+    let mut resource_usages: BTreeMap<u32, ResourceLifetimeUsage> = BTreeMap::new();
+    let mut hazard_states: HashMap<u32, ResourceHazardState> = HashMap::new();
+
+    let mut dep_graph = petgraph::graph::DiGraph::<usize, PassDependency>::with_capacity(pass_count, pass_count * 2);
+    let pass_nodes: Vec<petgraph::graph::NodeIndex> = (0..pass_count).map(|i| dep_graph.add_node(i)).collect();
+
+    for (pass_id, (read, write)) in passes.enumerate() {
+        for read in read {
+            let res_id = read.id;
+            record_usage(&mut resource_usages, res_id, pass_id, read.access);
+            let state = hazard_states.entry(res_id).or_default();
+            if let Some((w_pass, _)) = state.last_writer {
+                add_dep_edge(&mut dep_graph, &pass_nodes, w_pass, pass_id, res_id);
+            }
+
+            state.readers_since_write.push((pass_id, read.access.access_type));
+        }
+
+        for write in write {
+            let res_id = write.id;
+            record_usage(&mut resource_usages, res_id, pass_id, write.access);
+            let state = hazard_states.entry(res_id).or_default();
+            if !state.readers_since_write.is_empty() {
+                for (r_pass, _) in &state.readers_since_write {
+                    add_dep_edge(&mut dep_graph, &pass_nodes, *r_pass, pass_id, res_id);
+                }
+            } else if let Some((w_pass, _)) = state.last_writer {
+                add_dep_edge(&mut dep_graph, &pass_nodes, w_pass, pass_id, res_id);
+            }
+            state.last_writer = Some((pass_id, write.access.access_type));
+            state.readers_since_write.clear();
+        }
+    }
+
+    // Weakly-connected components via union-find over dependency edges. Any resource
+    // shared by multiple passes already produced at least one hazard edge above, so
+    // passes that share a resource end up in the same component.
+    let mut uf = petgraph::unionfind::UnionFind::<usize>::new(pass_count);
+    for edge in dep_graph.edge_indices() {
+        let (a, b) = dep_graph.edge_endpoints(edge).expect("edge from iterator must exist");
+        uf.union(a.index(), b.index());
+    }
+    let labels = uf.into_labeling();
+
+    let mut components_by_root: HashMap<usize, PassComponent> = HashMap::new();
+    for (pass_id, root) in labels.iter().enumerate() {
+        components_by_root
+            .entry(*root)
+            .or_insert_with(|| PassComponent {
+                passes: vec![],
+                resources: vec![],
+            })
+            .passes
+            .push(pass_id);
+    }
+    for (res_id, usage) in &resource_usages {
+        let root = labels[usage.first_pass];
+        components_by_root
+            .get_mut(&root)
+            .expect("pass component must exist for any resource that was touched")
+            .resources
+            .push(*res_id);
+    }
+
+    // `components_by_root` is a HashMap, so sort before handing the list on: bucket
+    // ids in `alias::plan` are handed out in component order, and stable ids keep
+    // graph dumps diffable across runs.
+    let mut components: Vec<PassComponent> = components_by_root.into_values().collect();
+    components.sort_unstable_by_key(|c| c.passes.first().copied().unwrap_or(usize::MAX));
+
+    PassAnalysis {
+        resource_usages,
+        dep_graph,
+        components,
+    }
+}
+
+/// Is `[start, end)` entirely inside `covered`? `covered` is kept sorted and
+/// merged by [`cover_range`], so a span crossing two entries is impossible —
+/// checking for one containing entry is exact.
+fn range_covered(covered: &[(u64, u64)], start: u64, end: u64) -> bool {
+    covered.iter().any(|(s, e)| *s <= start && end <= *e)
+}
+
+/// Add `[start, end)` to `covered`, keeping it sorted and merged.
+fn cover_range(covered: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+    covered.push((start, end));
+    covered.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(covered.len());
+    for (s, e) in covered.drain(..) {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    *covered = merged;
+}
+
 fn add_dep_edge(
     graph: &mut petgraph::graph::DiGraph<usize, PassDependency>,
     nodes: &[petgraph::graph::NodeIndex],
@@ -340,7 +456,7 @@ fn add_dep_edge(
 ///
 /// The ready set is also the natural hook for multi-queue — assigning a pass to a
 /// queue is a choice made at the moment it becomes ready.
-fn kahn_toposort(dep_graph: &petgraph::graph::DiGraph<usize, PassDependency>) -> SrResult<Vec<usize>> {
+pub(crate) fn kahn_toposort(dep_graph: &petgraph::graph::DiGraph<usize, PassDependency>) -> SrResult<Vec<usize>> {
     use petgraph::Direction;
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
@@ -1077,42 +1193,14 @@ impl RenderGraph {
         let slot = self.current_slot();
         let pass_count = self.passes.len();
 
-        let mut resource_usages: BTreeMap<u32, ResourceLifetimeUsage> = BTreeMap::new();
-        let mut hazard_states: HashMap<u32, ResourceHazardState> = HashMap::new();
-
-        let mut dep_graph = petgraph::graph::DiGraph::<usize, PassDependency>::with_capacity(pass_count, pass_count * 2);
-
-        let pass_nodes: Vec<petgraph::graph::NodeIndex> = (0..pass_count).map(|i| dep_graph.add_node(i)).collect();
-
-        for (pass_id, pass) in self.passes.iter().enumerate() {
+        let PassAnalysis {
+            resource_usages,
+            dep_graph,
+            components,
+        } = analyze_passes(self.passes.iter().map(|pass| {
             let common = pass.common();
-
-            for read in &common.read {
-                let res_id = read.id;
-                record_usage(&mut resource_usages, res_id, pass_id, read.access);
-                let state = hazard_states.entry(res_id).or_default();
-                if let Some((w_pass, _)) = state.last_writer {
-                    add_dep_edge(&mut dep_graph, &pass_nodes, w_pass, pass_id, res_id);
-                }
-
-                state.readers_since_write.push((pass_id, read.access.access_type));
-            }
-
-            for write in &common.write {
-                let res_id = write.id;
-                record_usage(&mut resource_usages, res_id, pass_id, write.access);
-                let state = hazard_states.entry(res_id).or_default();
-                if !state.readers_since_write.is_empty() {
-                    for (r_pass, _) in &state.readers_since_write {
-                        add_dep_edge(&mut dep_graph, &pass_nodes, *r_pass, pass_id, res_id);
-                    }
-                } else if let Some((w_pass, _)) = state.last_writer {
-                    add_dep_edge(&mut dep_graph, &pass_nodes, w_pass, pass_id, res_id);
-                }
-                state.last_writer = Some((pass_id, write.access.access_type));
-                state.readers_since_write.clear();
-            }
-        }
+            (common.read.as_slice(), common.write.as_slice())
+        }));
 
         // Cross-frame sync for temporal (ping-pong / history) resources: thread
         // each backing's end access this frame back into its stored import, so
@@ -1128,37 +1216,6 @@ impl RenderGraph {
                 set_import_access(&mut self.temporal_resources[ti].imports[ci], &end.end_accesses);
             }
         }
-
-        // Weakly-connected components via union-find over dependency edges. Any resource
-        // shared by multiple passes already produced at least one hazard edge above, so
-        // passes that share a resource end up in the same component.
-        let mut uf = petgraph::unionfind::UnionFind::<usize>::new(pass_count);
-        for edge in dep_graph.edge_indices() {
-            let (a, b) = dep_graph.edge_endpoints(edge).expect("edge from iterator must exist");
-            uf.union(a.index(), b.index());
-        }
-        let labels = uf.into_labeling();
-
-        let mut components_by_root: HashMap<usize, PassComponent> = HashMap::new();
-        for (pass_id, root) in labels.iter().enumerate() {
-            components_by_root
-                .entry(*root)
-                .or_insert_with(|| PassComponent {
-                    passes: vec![],
-                    resources: vec![],
-                })
-                .passes
-                .push(pass_id);
-        }
-        for (res_id, usage) in &resource_usages {
-            let root = labels[usage.first_pass];
-            components_by_root
-                .get_mut(&root)
-                .expect("pass component must exist for any resource that was touched")
-                .resources
-                .push(*res_id);
-        }
-        let components: Vec<PassComponent> = components_by_root.into_values().collect();
 
         self.transient_resources[slot].populate(
             Arc::clone(&self.core),
@@ -1183,7 +1240,7 @@ impl RenderGraph {
             &self.virtual_resources,
             &resource_usages,
             &schedule_pos,
-            &self.transient_resources[slot].resource_slots,
+            &self.transient_resources[slot].placements,
         );
         self.resource_end_states = end_states;
 
@@ -1293,14 +1350,14 @@ impl RenderGraph {
     /// epoch being entered). Moving a barrier earlier could merge more of them —
     /// see the interval-stabbing note in the plan — but it would add an ordering
     /// constraint that was not otherwise implied, so it is deliberately not done.
-    /// `resource_slots` maps a transient resource to the memory slot backing it;
-    /// resources sharing a slot alias the same memory and need a barrier between
-    /// consecutive occupants, which is why this runs after `populate`.
-    fn plan_barriers(
+    /// `placements` maps a transient resource to the memory it was bound into;
+    /// resources whose byte ranges overlap alias the same memory and need a barrier
+    /// between them, which is why this runs after `populate`.
+    pub(crate) fn plan_barriers(
         virtual_resources: &[GraphResourceInfo],
         resource_usages: &BTreeMap<u32, ResourceLifetimeUsage>,
         schedule_pos: &[usize],
-        resource_slots: &HashMap<u32, u32>,
+        placements: &HashMap<u32, Placement>,
     ) -> (HashMap<usize, Vec<ResourceBarrier>>, HashMap<u32, ResourceEndState>) {
         let mut barriers_at: HashMap<usize, Vec<ResourceBarrier>> = HashMap::new();
         let mut end_states: HashMap<u32, ResourceEndState> = HashMap::new();
@@ -1366,10 +1423,10 @@ impl RenderGraph {
         // A created resource's memory is bound this frame, so whatever it contains
         // belongs to someone else. Two cases:
         //
-        //   * it is the *first* occupant of its slot — the memory is freshly
-        //     allocated, so only an image needs a transition (out of UNDEFINED) and
-        //     a buffer needs nothing;
-        //   * it *reuses* a slot — the previous occupant's last access must complete
+        //   * nothing held those bytes earlier — the memory is freshly allocated, so
+        //     only an image needs a transition (out of UNDEFINED) and a buffer needs
+        //     nothing;
+        //   * it *reuses* bytes — every earlier occupant's last access must complete
         //     and be made available before this one's first access, or the two
         //     overlap in the same memory. `Nothing` alone cannot express that: its
         //     stage mask is empty, so the barrier carries no execution dependency at
@@ -1378,7 +1435,7 @@ impl RenderGraph {
         //
         // Aliased memory always discards: the previous occupant's layout says
         // nothing about this one, so the transition must come out of UNDEFINED.
-        let alias_predecessor = Self::slot_predecessors(resource_slots, resource_usages);
+        let alias_predecessors = Self::alias_predecessors(placements, resource_usages);
 
         for (res_id, info) in virtual_resources.iter().enumerate() {
             let res_id = res_id as u32;
@@ -1389,13 +1446,27 @@ impl RenderGraph {
                 continue;
             }
 
-            let seed = match alias_predecessor.get(&res_id) {
-                Some(prev_res) => {
-                    let prev_end = epochs_by_res
-                        .get(prev_res)
-                        .and_then(|e| e.last())
-                        .map(|e| e.accesses.clone())
-                        .unwrap_or_default();
+            let seed = match alias_predecessors.get(&res_id) {
+                Some(prev_resources) => {
+                    // Union of every earlier occupant of overlapping bytes. Under
+                    // offset packing a resource can land on top of several smaller
+                    // ones side by side, so a single predecessor is not enough.
+                    //
+                    // ponytail: unioned without pruning. A predecessor whose bytes
+                    // are fully covered by a later-ending one contributes a
+                    // redundant source access — wider than necessary, never
+                    // narrower. Prune by coverage if barriers get fat.
+                    let mut prev_end: Vec<vk_sync::AccessType> = Vec::new();
+                    for prev_res in prev_resources {
+                        let Some(last) = epochs_by_res.get(prev_res).and_then(|e| e.last()) else {
+                            continue;
+                        };
+                        for access in &last.accesses {
+                            if !prev_end.contains(access) {
+                                prev_end.push(*access);
+                            }
+                        }
+                    }
                     if prev_end.is_empty() {
                         continue;
                     }
@@ -1471,34 +1542,88 @@ impl RenderGraph {
         (barriers_at, end_states)
     }
 
-    /// For every transient resource that reuses a memory slot, the resource that
-    /// occupied that slot before it.
+    /// For every transient resource, every *earlier* resource that occupied bytes
+    /// it now overlaps.
     ///
-    /// `TransientResources::populate` only grants a slot to a new resource when the
-    /// current occupant's `last_pass` is strictly before the newcomer's
-    /// `first_pass`, so a slot's occupants form a non-overlapping sequence and
-    /// sorting them by `first_pass` recovers the order it assigned them in.
-    fn slot_predecessors(
-        resource_slots: &HashMap<u32, u32>,
+    /// "Earlier" is strict: `prev.last_pass < r.first_pass`. Two resources whose
+    /// lifetimes overlap must never have been given overlapping bytes in the first
+    /// place — [`alias::plan`](crate::render_graph::alias::plan) guarantees that,
+    /// and the random invariant suite is what checks it — so a byte overlap here
+    /// always means a sequential reuse that needs ordering.
+    ///
+    /// This is a set rather than a single predecessor because
+    /// [`AliasStrategy::Bucket`](crate::render_graph::alias::AliasStrategy) packs at
+    /// offsets: one resource can land on top of several smaller ones lying side by
+    /// side, and it must wait for all of them.
+    ///
+    /// The set is pruned to the ones that actually matter. Candidates are walked
+    /// latest-ending first and a candidate is dropped once the bytes it shares with
+    /// `r` are already covered by ones kept so far. That is safe, not merely
+    /// cheaper: a kept `k` covering dropped `p`'s bytes overlaps `p` in memory, so
+    /// their lifetimes were disjoint, and `k` ends later than `p`, so `k` started
+    /// after `p` finished — meaning `k`'s own alias barrier already waited on `p`.
+    /// Waiting on `k` waits on `p` transitively.
+    ///
+    /// Under `Slot` every member sits at offset 0, so the largest late-ending
+    /// occupant usually covers everything and this collapses to a single
+    /// predecessor — the behaviour before offset packing existed.
+    ///
+    /// ponytail: O(occupants²) per bucket. Real frames put tens of resources in a
+    /// bucket, so this is microseconds; `benches/alias.rs` shows it reaching tens of
+    /// milliseconds around 1024 transients. Reach for an interval tree over the
+    /// bucket's byte ranges only if graphs ever get that big.
+    fn alias_predecessors(
+        placements: &HashMap<u32, Placement>,
         resource_usages: &BTreeMap<u32, ResourceLifetimeUsage>,
-    ) -> HashMap<u32, u32> {
-        let mut by_slot: HashMap<u32, Vec<u32>> = HashMap::new();
-        for (res_id, slot) in resource_slots {
-            by_slot.entry(*slot).or_default().push(*res_id);
+    ) -> HashMap<u32, Vec<u32>> {
+        let mut by_bucket: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (res_id, placement) in placements {
+            by_bucket.entry(placement.bucket).or_default().push(*res_id);
         }
 
-        let mut predecessor = HashMap::new();
-        for occupants in by_slot.values_mut() {
+        let mut predecessors: HashMap<u32, Vec<u32>> = HashMap::new();
+        for occupants in by_bucket.values_mut() {
             if occupants.len() < 2 {
                 continue;
             }
-            // Same key `populate` sorted by, so this reproduces its ordering.
-            occupants.sort_by_key(|r| resource_usages.get(r).map_or(usize::MAX, |u| u.first_pass));
-            for pair in occupants.windows(2) {
-                predecessor.insert(pair[1], pair[0]);
+            // Latest-ending first; the id tiebreak keeps the walk deterministic.
+            // The greedy prune below depends on this order.
+            occupants.sort_unstable_by_key(|r| (std::cmp::Reverse(resource_usages.get(r).map_or(0, |u| u.last_pass)), *r));
+
+            let mut covered: Vec<(u64, u64)> = Vec::new();
+            for res_id in occupants.iter() {
+                let Some(first_pass) = resource_usages.get(res_id).map(|u| u.first_pass) else {
+                    continue;
+                };
+                let mine = placements[res_id];
+                let (lo, hi) = (mine.offset, mine.offset + mine.size);
+
+                covered.clear();
+                let mut prev: Vec<u32> = Vec::new();
+                for other in occupants.iter() {
+                    if other == res_id {
+                        continue;
+                    }
+                    // Strictly earlier only: a resource still live cannot have been
+                    // given bytes this one also holds.
+                    if !resource_usages.get(other).is_some_and(|u| u.last_pass < first_pass) {
+                        continue;
+                    }
+                    let theirs = placements[other];
+                    let (start, end) = (lo.max(theirs.offset), hi.min(theirs.offset + theirs.size));
+                    if start >= end || range_covered(&covered, start, end) {
+                        continue;
+                    }
+                    cover_range(&mut covered, start, end);
+                    prev.push(*other);
+                }
+                if !prev.is_empty() {
+                    prev.sort_unstable();
+                    predecessors.insert(*res_id, prev);
+                }
             }
         }
-        predecessor
+        predecessors
     }
 
     /// Return a `'static` checkpoint marker for `name`, leaking a fresh
@@ -1562,7 +1687,7 @@ impl RenderGraph {
                     id,
                     kind,
                     detail,
-                    slot: transient.resource_slots.get(&id).copied(),
+                    placement: transient.placements.get(&id).copied(),
                     import_access,
                 }
             })
@@ -1912,6 +2037,10 @@ mod tests {
         (0..n).collect()
     }
 
+    fn placed(bucket: u32, offset: u64, size: u64) -> Placement {
+        Placement { bucket, offset, size }
+    }
+
     /// A write followed by a run of three distinct reads followed by a write
     /// collapses to **two** barriers, not four: one RAW carrying the union of the
     /// three read accesses, one WAR carrying that same union as its source.
@@ -2086,8 +2215,8 @@ mod tests {
         u.insert(1, usages(&[(2, AccessType::ComputeShaderWrite)]));
 
         let mut slots = HashMap::new();
-        slots.insert(0u32, 0u32);
-        slots.insert(1u32, 0u32);
+        slots.insert(0u32, placed(0, 0, 4096));
+        slots.insert(1u32, placed(0, 0, 4096));
 
         let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(4), &slots);
 
@@ -2106,6 +2235,158 @@ mod tests {
         let (plain, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(4), &HashMap::new());
         let unaliased = plain[&2].iter().find(|b| b.resource_id == 1).expect("still needs a seed");
         assert_eq!(unaliased.prev, vec![AccessType::Nothing]);
+    }
+
+    /// Sharing a *bucket* is not sharing *memory*. Under offset packing two
+    /// resources sit in one allocation at disjoint byte ranges, and ordering them
+    /// against each other would be a dependency the graph never implied.
+    #[test]
+    fn same_bucket_disjoint_bytes_needs_no_alias_barrier() {
+        let resources = vec![
+            GraphResourceInfo::Created(GraphResourceDesc::Image(image(64, "low"))),
+            GraphResourceInfo::Created(GraphResourceDesc::Image(image(64, "high"))),
+        ];
+        let mut u = BTreeMap::new();
+        u.insert(
+            0,
+            usages(&[(0, AccessType::ComputeShaderWrite), (1, AccessType::ComputeShaderReadOther)]),
+        );
+        u.insert(1, usages(&[(2, AccessType::ComputeShaderWrite)]));
+
+        // Same bucket, adjacent-but-disjoint ranges: 0..1024 and 1024..2048.
+        let mut slots = HashMap::new();
+        slots.insert(0u32, placed(0, 0, 1024));
+        slots.insert(1u32, placed(0, 1024, 1024));
+
+        let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(4), &slots);
+        let seed = barriers[&2].iter().find(|b| b.resource_id == 1).expect("still needs a seed");
+        assert_eq!(
+            seed.prev,
+            vec![AccessType::Nothing],
+            "res 1 owns bytes res 0 never touched, so it seeds fresh, not from res 0"
+        );
+    }
+
+    /// One resource landing on top of two smaller ones lying side by side must be
+    /// ordered against *both*. This is the case the old "sort the slot's occupants
+    /// and pair consecutive ones" rule could not express: it would have picked one
+    /// predecessor and left the other unsynchronized.
+    #[test]
+    fn a_resource_covering_two_predecessors_waits_for_both() {
+        let resources = vec![
+            GraphResourceInfo::Created(GraphResourceDesc::Image(image(64, "low"))),
+            GraphResourceInfo::Created(GraphResourceDesc::Image(image(64, "high"))),
+            GraphResourceInfo::Created(GraphResourceDesc::Image(image(64, "covering"))),
+        ];
+        let mut u = BTreeMap::new();
+        // Two small resources live concurrently over passes 0..1, then a big one
+        // covering both their ranges starts at pass 2.
+        u.insert(
+            0,
+            usages(&[(0, AccessType::ComputeShaderWrite), (1, AccessType::TransferRead)]),
+        );
+        u.insert(
+            1,
+            usages(&[(0, AccessType::ComputeShaderWrite), (1, AccessType::ComputeShaderReadOther)]),
+        );
+        u.insert(2, usages(&[(2, AccessType::ComputeShaderWrite)]));
+
+        let mut slots = HashMap::new();
+        slots.insert(0u32, placed(0, 0, 1024));
+        slots.insert(1u32, placed(0, 1024, 1024));
+        slots.insert(2u32, placed(0, 0, 2048));
+
+        let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(4), &slots);
+        let seed = barriers[&2]
+            .iter()
+            .find(|b| b.resource_id == 2)
+            .expect("covering resource needs a seed");
+        assert!(
+            seed.prev.contains(&AccessType::TransferRead) && seed.prev.contains(&AccessType::ComputeShaderReadOther),
+            "must wait on both occupants it overwrites, got {:?}",
+            seed.prev
+        );
+        assert!(seed.discard);
+    }
+
+    /// The end-to-end tie between the two halves: whatever `alias::plan` decides,
+    /// every sequential reuse of overlapping bytes it produces ends up ordered.
+    /// Checked over seeded random graphs under both strategies — this is what says
+    /// a placement change can't silently introduce an unsynchronized alias.
+    ///
+    /// Ordering may be transitive. `alias_predecessors` drops a predecessor whose
+    /// bytes a later-ending one already covers, because that later one's own alias
+    /// barrier already waited on the dropped one. So the property to check is
+    /// *reachability* in the predecessor graph, not a direct edge — and separately,
+    /// that every resource with predecessors actually receives a discarding
+    /// barrier, since a chain of edges is worth nothing if no barrier is emitted.
+    #[test]
+    fn random_graphs_order_every_byte_reuse() {
+        use crate::render_graph::alias::{self, AliasStrategy};
+        use crate::render_graph::bench_support::{GenParams, gen_graph};
+
+        let params = GenParams::default();
+        for seed in 0..16u64 {
+            let fixture = gen_graph(seed, &params);
+            let (res, components) = fixture.alias_input();
+
+            for strategy in [AliasStrategy::Slot, AliasStrategy::Bucket] {
+                let (placements, _) = alias::plan(strategy, res, components, 64);
+                let usages = &fixture.analysis.resource_usages;
+                let predecessors = RenderGraph::alias_predecessors(&placements, usages);
+                let (barriers, _) =
+                    RenderGraph::plan_barriers(&fixture.virtual_resources, usages, &fixture.schedule_pos, &placements);
+
+                // Every resource that reuses someone's bytes must be entered
+                // through a discarding barrier carrying a real source access.
+                for res_id in predecessors.keys() {
+                    let seed_barrier = barriers
+                        .values()
+                        .flatten()
+                        .find(|b| b.resource_id == *res_id && b.discard)
+                        .unwrap_or_else(|| panic!("seed {seed} {strategy:?}: res {res_id} aliases with no discard barrier"));
+                    assert!(
+                        !seed_barrier.prev.is_empty() && !seed_barrier.prev.contains(&AccessType::Nothing),
+                        "seed {seed} {strategy:?}: res {res_id} enters aliased memory on {:?}, which carries \
+                         no execution dependency",
+                        seed_barrier.prev
+                    );
+                }
+
+                for a in res {
+                    for b in res {
+                        // `b` vacated these bytes before `a` claimed them.
+                        if a.id == b.id || b.last_pass >= a.first_pass || !placements[&a.id].overlaps(&placements[&b.id]) {
+                            continue;
+                        }
+                        assert!(
+                            waits_on(&predecessors, a.id, b.id),
+                            "seed {seed} {strategy:?}: res {} reuses res {}'s bytes but is never ordered after it",
+                            a.id,
+                            b.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Is `target` reachable from `from` in the alias-predecessor graph? Edges point
+    /// backwards in time, so this terminates.
+    fn waits_on(predecessors: &HashMap<u32, Vec<u32>>, from: u32, target: u32) -> bool {
+        let mut stack = vec![from];
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        while let Some(node) = stack.pop() {
+            for prev in predecessors.get(&node).into_iter().flatten() {
+                if *prev == target {
+                    return true;
+                }
+                if seen.insert(*prev) {
+                    stack.push(*prev);
+                }
+            }
+        }
+        false
     }
 
     /// The fold decision in `emit_barriers` is "does the layout actually change".
@@ -2181,25 +2462,25 @@ mod tests {
 
         println!("{transient:?}");
 
-        // Sanity: overlapping-lifetime resources must NOT share a slot.
-        assert_ne!(
-            transient.resource_slots[&0], transient.resource_slots[&1],
-            "res 0 and 1 overlap; must be in different slots"
+        // Sanity: overlapping-lifetime resources must NOT share bytes.
+        assert!(
+            !transient.placements[&0].overlaps(&transient.placements[&1]),
+            "res 0 and 1 overlap in time; they must not overlap in memory"
         );
-        assert_ne!(
-            transient.resource_slots[&2], transient.resource_slots[&3],
-            "res 2 and 3 overlap; must be in different slots"
+        assert!(
+            !transient.placements[&2].overlaps(&transient.placements[&3]),
+            "res 2 and 3 overlap in time; they must not overlap in memory"
         );
-        // Total slot count must be strictly fewer than the number of aliasable
+        // Total bucket count must be strictly fewer than the number of aliasable
         // resources — otherwise no aliasing happened at all.
         assert!(
             transient.slot_allocations.len() < 5,
-            "expected aliasing to reduce 5 resources to fewer slots; got {} slots",
+            "expected aliasing to reduce 5 resources to fewer buckets; got {} buckets",
             transient.slot_allocations.len()
         );
-        // Sampler must have been materialized but not slot-aliased.
+        // Sampler must have been materialized but not aliased.
         assert_eq!(transient.transient_samplers.len(), 1);
-        assert!(!transient.resource_slots.contains_key(&5));
+        assert!(!transient.placements.contains_key(&5));
     }
 
     /// End-to-end compile test: two compute passes with a producer→consumer
@@ -2258,7 +2539,7 @@ mod tests {
             common1.render(move |cb, tr| {
                 assert_ne!(*cb, vk::CommandBuffer::null(), "consumer got null cmd buffer");
                 // img_a must be bound to a transient slot at this point.
-                assert!(tr.resource_slots.contains_key(&0), "img_a not bound after populate");
+                assert!(tr.placements.contains_key(&0), "img_a not bound after populate");
                 trace.lock().push("consumer");
                 Ok(())
             });

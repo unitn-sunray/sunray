@@ -30,6 +30,10 @@ pub(crate) const SERIALIZE_FRAMES: &str = "SUNRAY_SERIALIZE_FRAMES";
 /// (`1`/`true`/`on`) dumps into [`DEFAULT_GRAPH_DUMP_DIR`]; anything else is
 /// taken as the destination directory. See [`graph_dump_dir`].
 pub(crate) const GRAPH_DUMP_DIR: &str = "SUNRAY_GRAPH_DUMP_DIR";
+/// Transient memory aliasing algorithm: `slot` (default) or `bucket`. Changes how
+/// much VRAM the render graph's transient resources take, never what is rendered.
+/// Parsed by [`AliasStrategy::from_env`](crate::render_graph::alias::AliasStrategy::from_env).
+pub(crate) const ALIAS_STRATEGY: &str = "SUNRAY_ALIAS_STRATEGY";
 
 /// Where graph dumps land when the var is on but names no directory: `<crate>/debug`
 /// (git-ignored).

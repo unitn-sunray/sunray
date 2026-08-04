@@ -1,3 +1,8 @@
+pub mod alias;
+/// Seeded random fixture generators, shared by the in-crate invariant tests and
+/// the `benches/` crate. Public only so `cargo bench` can reach it.
+#[doc(hidden)]
+pub mod bench_support;
 pub mod error;
 pub mod graph;
 pub(crate) mod graph_debug;

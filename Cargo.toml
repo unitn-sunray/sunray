@@ -96,6 +96,11 @@ shader-slang = "0.1.0"
 winit = { version = "0.30.9", features = ["rwh_05"] } #window example
 log4rs = "1.4.0" #logging for examples
 image = "0.25.8" #png example
+criterion = "0.8.2" #render graph + transient aliasing benchmarks
+
+[[bench]]
+name = "alias"
+harness = false
 
 [[example]]
 name = "png"

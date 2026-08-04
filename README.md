@@ -23,10 +23,22 @@ an unrecognized value logs a warning and falls back to the default.
 | `SUNRAY_ENABLE_NVIDIA_AFTERMATH` | off | NVIDIA Aftermath crash dumps. The full user-space handler also needs the `nvidia-aftermath` feature |
 | `SUNRAY_SERIALIZE_FRAMES` | **on** | Whole-frame serialization. Set to `0` to opt into frame overlap — known async use-after-free crash inside the NVIDIA driver, see `Renderer::render` |
 | `SUNRAY_GRAPH_DUMP_DIR` | off | Per-frame render-graph dump (`.dot` + `.txt`). `1` writes into `<crate>/debug` (git-ignored); any other value is used as the destination directory |
+| `SUNRAY_ALIAS_STRATEGY` | `slot` | Transient memory aliasing algorithm. `slot` gives each resource its own bucket at offset 0; `bucket` packs lifetime-disjoint resources at offsets inside one bucket, roughly halving transient VRAM at a higher compile cost. Affects memory only, never what is rendered |
 | `SUNRAY_SHADER_DEBUG` | off | **Build-time.** Disables shader optimization and emits maximal SPIR-V debug info so GPU debuggers resolve Slang source. Changing it re-runs the build script |
 
-Read once at `Renderer` construction, except `SUNRAY_GRAPH_DUMP_DIR` (per frame)
-and `SUNRAY_SHADER_DEBUG` (build script).
+Read once at `Renderer` construction, except `SUNRAY_GRAPH_DUMP_DIR` and
+`SUNRAY_ALIAS_STRATEGY` (per frame) and `SUNRAY_SHADER_DEBUG` (build script).
+
+### Benchmarks
+
+`benches/alias.rs` (criterion) measures aliasing and render-graph analysis on
+seeded random graphs; the memory-quality comparison between the two strategies
+is a separate reporting test:
+
+```sh
+cargo bench                                                # wall-clock scaling
+cargo test alias_quality_report -- --ignored --nocapture   # bytes vs. optimum
+```
 
 `.cargo/config.toml` sets the common ones plus run aliases for the examples —
 `cargo win` / `cargo png` / `cargo bevy` build release, and the `-dbg` variants

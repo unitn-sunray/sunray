@@ -1,4 +1,5 @@
 use crate::error::{SrError, SrResult};
+use crate::render_graph::alias::{self, AliasResource, AliasStrategy, Placement};
 use crate::render_graph::graph::{
     CachedPipeline, PassComponent, PipelineCache, PipelineHandle, ResourceBarrier, ResourceLifetimeUsage,
 };
@@ -28,12 +29,12 @@ pub struct TransientResources {
     pub(super) transient_buffers: HashMap<u32, RawBuffer>,
     /// Samplers are not memory-backed in the aliasable sense; one per resource id.
     pub(super) transient_samplers: HashMap<u32, Sampler>,
-    /// One `gpu_allocator` allocation per memory slot. Resources sharing a slot
-    /// bind to the same `Allocation` at offset 0. Indexed by slot id.
+    /// One `gpu_allocator` allocation per memory bucket. Resources sharing a bucket
+    /// bind into the same `Allocation`, each at its own offset. Indexed by bucket id.
     pub(super) slot_allocations: Vec<gpu_allocator::vulkan::Allocation>,
-    /// Maps each aliased transient resource id (images + buffers) to its slot id
-    /// in `slot_allocations`. Samplers and AS are absent (they're not aliased).
-    pub(super) resource_slots: HashMap<u32, u32>,
+    /// Where each aliased transient resource (images + buffers) landed: bucket id
+    /// plus byte range. Samplers and AS are absent (they're not aliased).
+    pub(super) placements: HashMap<u32, Placement>,
     /// Trace of the barriers that `compile` issued, in topological order, one
     /// entry per pass that needed at least one barrier. Populated by `compile`
     /// after `populate` has wired resources, cleared on `free_internal_state`.
@@ -46,18 +47,6 @@ pub struct TransientResources {
     /// cleared by `free_internal_state`: passes are rebuilt each frame but their
     /// pipelines are interned once and reused (see [`PipelineCache`]).
     pub(super) pipeline_cache: PipelineCache,
-}
-
-/// Aggregated memory requirements for a single transient alias slot — built up as
-/// resources are folded in, then handed to `gpu_allocator` once per slot.
-#[derive(Clone, Copy, Debug)]
-struct SlotMemReqs {
-    size: u64,
-    alignment: u64,
-    /// AND of every member's `memory_type_bits`. A slot whose intersection is
-    /// empty cannot be allocated and signals a bad aliasing decision.
-    memory_type_bits: u32,
-    location: gpu_allocator::MemoryLocation,
 }
 
 /// Pre-built `vk::Image` / `vk::Buffer` handle with its memory requirements; held
@@ -94,15 +83,13 @@ impl PendingTransient {
 impl TransientResources {
     /// Allocate (or import) backing storage for every virtual resource.
     ///
-    /// Slots are assigned by lifetime alone — a buffer's memory can later back an
-    /// image and vice versa. Compatibility is enforced at slot creation: when a
-    /// candidate slot is reused, its accumulated `memory_type_bits` must still
-    /// intersect with the new member's; otherwise a fresh slot is opened. The
-    /// resulting slot allocation's `requirements = (max size, max alignment, AND
-    /// of memory_type_bits)` is what `gpu_allocator` actually sees.
+    /// Memory is assigned by lifetime alone — a buffer's memory can later back an
+    /// image and vice versa — subject to `memory_type_bits` and heap compatibility.
+    /// The policy is [`alias::plan`], selected by `SUNRAY_ALIAS_STRATEGY`; see that
+    /// module for what the two strategies do and how they differ.
     ///
     /// Lifetime + Drop:
-    ///   - Slot allocations live on `Self`. `Drop` frees them via the cached `core`.
+    ///   - Bucket allocations live on `Self`. `Drop` frees them via the cached `core`.
     ///   - Individual transient `Image` / `RawBuffer` wrappers are constructed with
     ///     `owns_memory == false` so their own `Drop` only destroys the `vk::Image`
     ///     / `vk::Buffer` handle (+ view), never `Allocator::free`.
@@ -180,92 +167,60 @@ impl TransientResources {
             }
         }
 
-        // ---------- Phase 2: per-component slot assignment by lifetime, with mem compat. ----------
-        // Slots are global (numbered across all components). Reuse condition: the
-        // candidate slot's last_pass < this resource's first_pass AND its current
-        // (memory_type_bits, location) is compatible with this resource's
-        // (memory_type_bits, location). On reuse, the slot's accumulated requirements
-        // grow to the max(size), max(alignment), AND(memory_type_bits).
-        //TODO this conditions can be relaxed especially on the memory type side
-        let mut next_slot: u32 = 0;
-        let mut slot_reqs: HashMap<u32, SlotMemReqs> = HashMap::new();
-        for component in components {
-            // (last_pass_in_slot, slot_id) — kind isn't tracked here, slot_reqs drives compat.
-            let mut active: Vec<(usize, u32)> = Vec::new();
+        // ---------- Phase 2: assign every transient a bucket + offset. ----------
+        // The policy itself lives in `alias` — Vulkan-free so it can be tested and
+        // benchmarked without a device. Everything here is marshalling.
+        //TODO the memory-type condition inside `alias` can be relaxed
+        let granularity = core.device().properties().limits.buffer_image_granularity;
+        let alias_resources: Vec<AliasResource> = pending
+            .iter()
+            .map(|(res_id, p)| {
+                let reqs = p.reqs();
+                let lifetime = &usages[res_id];
+                AliasResource {
+                    id: *res_id,
+                    size: reqs.size,
+                    alignment: reqs.alignment,
+                    memory_type_bits: reqs.memory_type_bits,
+                    location: p.location(),
+                    first_pass: lifetime.first_pass,
+                    last_pass: lifetime.last_pass,
+                }
+            })
+            .collect();
+        let alias_components: Vec<Vec<u32>> = components
+            .iter()
+            .map(|c| c.resources.iter().copied().filter(|id| pending.contains_key(id)).collect())
+            .collect();
 
-            let mut transients: Vec<u32> = component
-                .resources
-                .iter()
-                .copied()
-                .filter(|res_id| pending.contains_key(res_id))
-                .collect();
-            transients.sort_by_key(|res_id| usages[res_id].first_pass);
+        let strategy = AliasStrategy::from_env();
+        let (placements, buckets) = alias::plan(strategy, &alias_resources, &alias_components, granularity);
+        self.placements = placements;
 
-            for res_id in transients {
-                let lifetime = &usages[&res_id];
-                let p = &pending[&res_id];
-                let this_reqs = p.reqs();
-                let this_loc = p.location();
-
-                let candidate = active.iter().position(|(last_pass, slot)| {
-                    if *last_pass >= lifetime.first_pass {
-                        return false;
-                    }
-                    let s = &slot_reqs[slot];
-                    s.location == this_loc && (s.memory_type_bits & this_reqs.memory_type_bits) != 0
-                });
-
-                let slot = if let Some(idx) = candidate {
-                    let (_, slot) = active[idx];
-                    let s = slot_reqs.get_mut(&slot).expect("slot reqs missing");
-                    s.size = s.size.max(this_reqs.size);
-                    s.alignment = s.alignment.max(this_reqs.alignment);
-                    s.memory_type_bits &= this_reqs.memory_type_bits;
-                    active[idx] = (lifetime.last_pass, slot);
-                    slot
-                } else {
-                    let slot = next_slot;
-                    next_slot += 1;
-                    slot_reqs.insert(
-                        slot,
-                        SlotMemReqs {
-                            size: this_reqs.size,
-                            alignment: this_reqs.alignment,
-                            memory_type_bits: this_reqs.memory_type_bits,
-                            location: this_loc,
-                        },
-                    );
-                    active.push((lifetime.last_pass, slot));
-                    slot
-                };
-                self.resource_slots.insert(res_id, slot);
-            }
-        }
-
-        // ---------- Phase 3: allocate one chunk of memory per slot. ----------
-        // Iterate by slot id so `slot_allocations[i]` corresponds to slot `i`.
-        let mut slot_allocations: Vec<gpu_allocator::vulkan::Allocation> = Vec::with_capacity(next_slot as usize);
-        for slot in 0..next_slot {
-            let s = slot_reqs[&slot];
-            if s.memory_type_bits == 0 {
-                // Should not be reachable: the compat check above guarantees a non-zero
-                // intersection on every reuse.
+        // ---------- Phase 3: allocate one chunk of memory per bucket. ----------
+        // Iterate by bucket id so `slot_allocations[i]` corresponds to bucket `i`.
+        let mut slot_allocations: Vec<gpu_allocator::vulkan::Allocation> = Vec::with_capacity(buckets.len());
+        for (bucket, reqs) in buckets.iter().enumerate() {
+            if reqs.memory_type_bits == 0 {
+                // Should not be reachable: `alias::plan` only folds a resource into a
+                // bucket whose intersection with it is non-empty.
                 return Err(SrError::new_custom(format!(
-                    "transient slot {slot}: empty memory_type_bits after aliasing"
+                    "transient bucket {bucket}: empty memory_type_bits after aliasing"
                 )));
             }
             let mem_reqs = vk::MemoryRequirements {
-                size: s.size,
-                alignment: s.alignment,
-                memory_type_bits: s.memory_type_bits,
+                size: reqs.size,
+                alignment: reqs.alignment,
+                memory_type_bits: reqs.memory_type_bits,
             };
-            // linear: false — slots may host optimal-tiled images, and since members
-            // never co-occupy the slot, bufferImageGranularity within the allocation
-            // isn't an issue. Buffers placed in non-linear regions still work.
+            // linear: false — buckets may host optimal-tiled images. Under `Bucket`
+            // two members *can* co-occupy, so bufferImageGranularity matters within
+            // the allocation; `alias::plan` was handed the limit and padded every
+            // placement to it. Buffers placed in non-linear regions still work.
             let allocation = core.allocator_mut().allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
                 name: "render_graph_transient_slot",
                 requirements: mem_reqs,
-                location: s.location,
+                location: reqs.location,
                 linear: false,
                 allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
             })?;
@@ -276,11 +231,14 @@ impl TransientResources {
         let device = core.device().inner();
         let name_objects = core.debug_labels_enabled();
         for (res_id, p) in pending {
-            let slot = self.resource_slots[&res_id];
-            let alloc = &slot_allocations[slot as usize];
+            let placement = self.placements[&res_id];
+            let alloc = &slot_allocations[placement.bucket as usize];
+            // The allocation's own offset into its `vk::DeviceMemory`, plus where
+            // inside the bucket the placer put this resource.
+            let base = alloc.offset() + placement.offset;
             match p {
                 PendingTransient::Image { handle, reqs, desc } => {
-                    unsafe { device.bind_image_memory(handle, alloc.memory(), alloc.offset()) }?;
+                    unsafe { device.bind_image_memory(handle, alloc.memory(), base) }?;
                     if name_objects && let Ok(cname) = std::ffi::CString::new(desc.name) {
                         core.set_debug_object_name(handle, &cname);
                     }
@@ -296,7 +254,7 @@ impl TransientResources {
                     self.transient_images.insert(res_id, image);
                 }
                 PendingTransient::Buffer { handle, reqs: _, desc } => {
-                    unsafe { device.bind_buffer_memory(handle, alloc.memory(), alloc.offset()) }?;
+                    unsafe { device.bind_buffer_memory(handle, alloc.memory(), base) }?;
                     if name_objects && let Ok(cname) = std::ffi::CString::new(desc.name) {
                         core.set_debug_object_name(handle, &cname);
                     }
@@ -354,7 +312,7 @@ impl TransientResources {
         self.transient_images.clear();
         self.transient_buffers.clear();
         self.transient_samplers.clear();
-        self.resource_slots.clear();
+        self.placements.clear();
         self.recorded_barriers.clear();
 
         if let Some(core) = self.core.as_ref() {
@@ -535,12 +493,12 @@ impl TransientResources {
 
 impl std::fmt::Debug for TransientResources {
     /// Renders the aliasing decisions in the same "report" layout used by the
-    /// transient_aliasing_debug test: header, per-slot allocation table, per-resource
-    /// slot assignment, and grouped aliasing sets. Lifetimes aren't
+    /// transient_aliasing_debug test: header, per-bucket allocation table,
+    /// per-resource placement, and grouped aliasing sets. Lifetimes aren't
     /// stored on `self`, so they're omitted here — only what `populate` left
     /// behind is printed.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let aliasable = self.resource_slots.len();
+        let aliasable = self.placements.len();
         let imported = self.external_images.len()
             + self.external_buffers.len()
             + self.external_samplers.len()
@@ -555,15 +513,22 @@ impl std::fmt::Debug for TransientResources {
         writeln!(f, "  transient samplers        : {}", self.transient_samplers.len())?;
         writeln!(f, "  imported                  : {imported}")?;
         writeln!(f, "aliasable resources (img+buf): {aliasable}")?;
-        writeln!(f, "slot allocations            : {}", self.slot_allocations.len())?;
+        writeln!(f, "bucket allocations          : {}", self.slot_allocations.len())?;
+        let total: u64 = self.slot_allocations.iter().map(|a| a.size()).sum();
+        let requested: u64 = self.placements.values().map(|p| p.size).sum();
+        writeln!(
+            f,
+            "allocated / requested bytes : {total} / {requested} ({:.0}%)",
+            100.0 * total as f64 / requested.max(1) as f64
+        )?;
         writeln!(f)?;
 
-        writeln!(f, "Per-slot allocation:")?;
+        writeln!(f, "Per-bucket allocation:")?;
         for (i, alloc) in self.slot_allocations.iter().enumerate() {
             let mem = unsafe { alloc.memory() };
             writeln!(
                 f,
-                "  slot {i}: size={:>8} offset={:>8} memory={:?}",
+                "  bucket {i}: size={:>8} offset={:>8} memory={:?}",
                 alloc.size(),
                 alloc.offset(),
                 mem,
@@ -571,32 +536,34 @@ impl std::fmt::Debug for TransientResources {
         }
         writeln!(f)?;
 
-        writeln!(f, "Per-resource slot assignment:")?;
-        let mut assignments: Vec<(u32, u32)> = self.resource_slots.iter().map(|(r, s)| (*r, *s)).collect();
-        assignments.sort();
-        for (res_id, slot_id) in &assignments {
-            let kind = if let Some(img) = self.transient_images.get(res_id) {
-                let e = img.extent();
-                format!("Image {}x{}x{}", e.width, e.height, e.depth)
-            } else if let Some(buf) = self.transient_buffers.get(res_id) {
-                format!("Buffer {} bytes", buf.byte_size())
-            } else {
-                "???".to_string()
-            };
-            writeln!(f, "  res {res_id} {kind:<32} -> slot {slot_id}")?;
+        // Grouped by bucket, ordered by offset — under `Bucket` the offsets are the
+        // interesting part, since that is where the packing shows up.
+        let mut by_bucket: BTreeMap<u32, Vec<(u32, Placement)>> = BTreeMap::new();
+        for (r, p) in &self.placements {
+            by_bucket.entry(p.bucket).or_default().push((*r, *p));
         }
-        writeln!(f)?;
-
-        let mut by_slot: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-        for (r, s) in &self.resource_slots {
-            by_slot.entry(*s).or_default().push(*r);
-        }
-        writeln!(f, "Aliasing groups (slot -> resources sharing memory):")?;
-        for (slot, members) in &by_slot {
-            let mut m = members.clone();
-            m.sort();
-            let aliased = if m.len() > 1 { " (ALIASED)" } else { "" };
-            writeln!(f, "  slot {slot} <- resources {m:?}{aliased}")?;
+        writeln!(f, "Aliasing groups (bucket -> resources sharing memory):")?;
+        for (bucket, members) in &mut by_bucket {
+            members.sort_by_key(|(r, p)| (p.offset, *r));
+            let aliased = if members.len() > 1 { " (ALIASED)" } else { "" };
+            let capacity = self.slot_allocations.get(*bucket as usize).map_or(0, |a| a.size());
+            writeln!(f, "  bucket {bucket} ({capacity} bytes){aliased}")?;
+            for (res_id, p) in members.iter() {
+                let kind = if let Some(img) = self.transient_images.get(res_id) {
+                    let e = img.extent();
+                    format!("Image {}x{}x{}", e.width, e.height, e.depth)
+                } else if let Some(buf) = self.transient_buffers.get(res_id) {
+                    format!("Buffer {} bytes", buf.byte_size())
+                } else {
+                    "???".to_string()
+                };
+                writeln!(
+                    f,
+                    "    res {res_id:>3} {kind:<28} @ {:>9}..{:<9}",
+                    p.offset,
+                    p.offset + p.size
+                )?;
+            }
         }
 
         // Non-aliased extras
@@ -604,7 +571,7 @@ impl std::fmt::Debug for TransientResources {
             writeln!(f)?;
             let mut samplers: Vec<u32> = self.transient_samplers.keys().copied().collect();
             samplers.sort();
-            writeln!(f, "Transient samplers (not slot-aliased): {samplers:?}")?;
+            writeln!(f, "Transient samplers (not aliased): {samplers:?}")?;
         }
         if imported > 0 {
             writeln!(f)?;

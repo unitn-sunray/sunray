@@ -5,7 +5,7 @@
 //!   - `graph_frame_<n>.dot` — Graphviz: passes as nodes, dependency edges
 //!     labeled with the barriers they carry, plus a `FRAME_ENTRY` node holding
 //!     the init / cross-frame barriers. Render with `dot -Tsvg`.
-//!   - `graph_frame_<n>.txt` — the resource table (kind / size / aliasing slot /
+//!   - `graph_frame_<n>.txt` — the resource table (kind / size / `bucket@offset` /
 //!     **imported cross-frame access**) and the transient aliasing report.
 //!
 //! The cross-frame access column shows the access each imported resource is
@@ -22,6 +22,7 @@ use std::fmt::Write as _;
 
 use vk_sync_fork as vk_sync;
 
+use crate::render_graph::alias::Placement;
 use crate::render_graph::graph::ResourceBarrier;
 
 /// One row of the per-frame resource table.
@@ -31,8 +32,8 @@ pub(crate) struct ResourceDumpInfo {
     pub kind: &'static str,
     /// Size / extent / name detail for the row.
     pub detail: String,
-    /// Aliasing slot this resource binds to (transient only).
-    pub slot: Option<u32>,
+    /// Where this resource binds in aliased memory (transient only).
+    pub placement: Option<Placement>,
     /// For imported resources: every access the previous frame left it in, which
     /// `__imports` declares and the first consumer is ordered against. `None` for
     /// created ones.
@@ -118,9 +119,14 @@ impl GraphDump<'_> {
             let _ = writeln!(s, "  pass {i}: {name}");
         }
 
-        let _ = writeln!(s, "\nResources (id | kind | detail | slot | cross-frame access):");
+        let _ = writeln!(s, "\nResources (id | kind | detail | bucket@offset | cross-frame access):");
         for r in &self.resources {
-            let slot = r.slot.map(|s| s.to_string()).unwrap_or_else(|| "-".into());
+            // `bucket@offset` — under SUNRAY_ALIAS_STRATEGY=bucket several resources
+            // share a bucket at once, so the offset is what distinguishes them.
+            let slot = r
+                .placement
+                .map(|p| format!("{}@{}", p.bucket, p.offset))
+                .unwrap_or_else(|| "-".into());
             match &r.import_access {
                 Some(accesses) => {
                     let flag = if accesses.iter().all(|a| *a == vk_sync::AccessType::Nothing) {
@@ -130,12 +136,12 @@ impl GraphDump<'_> {
                     };
                     let _ = writeln!(
                         s,
-                        "  {:>3} | {:<16} | {:<28} | slot {:<3} | {:?}{}",
+                        "  {:>3} | {:<16} | {:<28} | {:<16} | {:?}{}",
                         r.id, r.kind, r.detail, slot, accesses, flag
                     );
                 }
                 None => {
-                    let _ = writeln!(s, "  {:>3} | {:<16} | {:<28} | slot {:<3} | -", r.id, r.kind, r.detail, slot);
+                    let _ = writeln!(s, "  {:>3} | {:<16} | {:<28} | {:<16} | -", r.id, r.kind, r.detail, slot);
                 }
             }
         }

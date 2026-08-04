@@ -251,8 +251,17 @@ impl Device {
 
             unsafe { instance.get_physical_device_properties2(physical_device, &mut physical_device_properties) };
 
+            // Last use of the chain wrapper; the `&mut` borrows below are free after this.
+            let properties = physical_device_properties.properties;
+
+            // `push` chained these to each other; the links point at locals that are about to
+            // move into `Self`, so cut them before the `'static` annotation becomes a lie.
+            physical_device_rt_pipeline_properties.p_next = std::ptr::null_mut();
+            physical_device_acceleration_structure_properties.p_next = std::ptr::null_mut();
+            physical_device_descriptor_heap_properties.p_next = std::ptr::null_mut();
+
             (
-                physical_device_properties.properties,
+                properties,
                 physical_device_rt_pipeline_properties,
                 physical_device_acceleration_structure_properties,
                 physical_device_descriptor_heap_properties,

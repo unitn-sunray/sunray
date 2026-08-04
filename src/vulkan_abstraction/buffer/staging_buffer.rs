@@ -136,7 +136,6 @@ impl<T> StagingBuffer<T> {
     }
 
     pub fn clone_section_into_gpu_only_buffer(
-        //TODO this does a queue transfer,does it make sense and when should it do it
         &self,
         src_offset: DeviceSize,
         src_section_length: DeviceSize,
@@ -165,86 +164,38 @@ impl<T> StagingBuffer<T> {
         }
 
         let device = self.raw.core.device().inner();
-        let transfer_family = self.raw.core.transfer_queue().queue_family_index();
-        let graphics_family = self.raw.core.graphics_queue().queue_family_index();
-        let dedicated_transfer = transfer_family != graphics_family;
+        let (dst_stage_mask, dst_access_mask) = infer_read_masks_from_usage(dst.usage());
 
-        let dst_usage = dst.usage();
-        let (dst_stage_mask, dst_access_mask) = infer_read_masks_from_usage(dst_usage);
-
-        // --- Transfer queue: copy + release ownership (or full barrier if same family) ---
-        let transfer_cmd = vulkan_abstraction::cmd_buffer::new_command_buffer(self.raw.core.transfer_cmd_pool(), device)?;
+        // ponytail: upload on the universal queue — no dedicated transfer queue, so no
+        // queue-family ownership transfer. Move back to the transfer queue only if
+        // uploads measurably contend with graphics work.
+        let cmd = vulkan_abstraction::cmd_buffer::new_command_buffer(self.raw.core.graphics_cmd_pool(), device)?;
 
         let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { device.begin_command_buffer(transfer_cmd, &begin_info) }?;
+        unsafe { device.begin_command_buffer(cmd, &begin_info) }?;
 
         let regions = [vk::BufferCopy::default()
             .size(src_section_length)
             .src_offset(src_offset)
             .dst_offset(0)];
-        unsafe { device.cmd_copy_buffer(transfer_cmd, self.inner(), dst.inner(), &regions) };
+        unsafe { device.cmd_copy_buffer(cmd, self.inner(), dst.inner(), &regions) };
 
-        if dedicated_transfer {
-            // Release ownership: dstStageMask must be NONE (only TRANSFER stages are valid here).
-            // The acquire on the graphics queue will carry the real dst stage/access masks.
-            // (A queue-family ownership transfer is required because maintenance9 is disabled
-            // — see device.rs. This is the BestPractices-unneeded-QFOT hint's subject.)
-            let release_barrier = vk::BufferMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-                .dst_access_mask(vk::AccessFlags2::NONE)
-                .src_queue_family_index(transfer_family)
-                .dst_queue_family_index(graphics_family)
-                .buffer(dst.inner())
-                .offset(0)
-                .size(src_section_length);
-            let dep = vk::DependencyInfo::default().buffer_memory_barriers(std::slice::from_ref(&release_barrier));
-            unsafe { device.cmd_pipeline_barrier2(transfer_cmd, &dep) };
-        } else {
-            // Same queue family: full barrier is valid here.
-            let barrier = vk::BufferMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(dst_stage_mask)
-                .dst_access_mask(dst_access_mask)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(dst.inner())
-                .offset(0)
-                .size(src_section_length);
-            let dep = vk::DependencyInfo::default().buffer_memory_barriers(std::slice::from_ref(&barrier));
-            unsafe { device.cmd_pipeline_barrier2(transfer_cmd, &dep) };
-        }
+        let barrier = vk::BufferMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(dst_stage_mask)
+            .dst_access_mask(dst_access_mask)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(dst.inner())
+            .offset(0)
+            .size(src_section_length);
+        let dep = vk::DependencyInfo::default().buffer_memory_barriers(std::slice::from_ref(&barrier));
+        unsafe { device.cmd_pipeline_barrier2(cmd, &dep) };
 
-        unsafe { device.end_command_buffer(transfer_cmd) }?;
-        self.raw.core.transfer_queue().submit_sync(transfer_cmd)?;
-        unsafe { device.free_command_buffers(self.raw.core.transfer_cmd_pool().inner(), &[transfer_cmd]) };
-
-        if dedicated_transfer {
-            // Acquire ownership on the graphics queue, now with the real dst stage/access masks.
-            // CPU-side fence-wait above guarantees the release has completed before this submit.
-            let graphics_cmd = vulkan_abstraction::cmd_buffer::new_command_buffer(self.raw.core.graphics_cmd_pool(), device)?;
-            let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            unsafe { device.begin_command_buffer(graphics_cmd, &begin_info) }?;
-
-            let acquire_barrier = vk::BufferMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(dst_stage_mask)
-                .dst_access_mask(dst_access_mask)
-                .src_queue_family_index(transfer_family)
-                .dst_queue_family_index(graphics_family)
-                .buffer(dst.inner())
-                .offset(0)
-                .size(src_section_length);
-            let dep = vk::DependencyInfo::default().buffer_memory_barriers(std::slice::from_ref(&acquire_barrier));
-            unsafe { device.cmd_pipeline_barrier2(graphics_cmd, &dep) };
-
-            unsafe { device.end_command_buffer(graphics_cmd) }?;
-            self.raw.core.graphics_queue().submit_sync(graphics_cmd)?;
-            unsafe { device.free_command_buffers(self.raw.core.graphics_cmd_pool().inner(), &[graphics_cmd]) };
-        }
+        unsafe { device.end_command_buffer(cmd) }?;
+        self.raw.core.graphics_queue().submit_sync(cmd)?;
+        unsafe { device.free_command_buffers(self.raw.core.graphics_cmd_pool().inner(), &[cmd]) };
 
         Ok(())
     }
