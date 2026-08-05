@@ -396,7 +396,10 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
                                 completed.store(next_frame, Ordering::Release);
                                 next_frame += 1;
                             }
-                            Err(vk::Result::TIMEOUT) => continue,
+                            Err(vk::Result::TIMEOUT) => {
+                                log::debug!("frame watcher: timeout waiting graph timeline for frame {next_frame}");
+                                continue;
+                            }
                             Err(e) => {
                                 log::error!("sunray frame watcher: vkWaitSemaphores failed with {e:?}; exiting");
                                 break;
