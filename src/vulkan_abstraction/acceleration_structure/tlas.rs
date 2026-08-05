@@ -265,6 +265,7 @@ impl Tlas {
 
 impl Drop for Tlas {
     fn drop(&mut self) {
-        self.accel.core().descriptor_heap_mut().free(self.slot);
+        let freed_at = self.accel.core().absolute_frame_count() as u64;
+        self.accel.core().descriptor_heap_mut().free(self.slot, freed_at);
     }
 }

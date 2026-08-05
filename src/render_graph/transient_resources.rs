@@ -309,11 +309,12 @@ impl TransientResources {
         // Drop the wrappers first: their Drop destroys vk handles and skips
         // Allocator::free (owns_memory == false), so the underlying allocations are
         // still valid afterwards.
+        self.placements.clear();
+        self.recorded_barriers.clear();
+
         self.transient_images.clear();
         self.transient_buffers.clear();
         self.transient_samplers.clear();
-        self.placements.clear();
-        self.recorded_barriers.clear();
 
         if let Some(core) = self.core.as_ref() {
             let mut allocator = core.allocator_mut();

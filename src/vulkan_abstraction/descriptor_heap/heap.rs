@@ -1,6 +1,8 @@
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use crate::MAX_FRAMES_IN_FLIGHT;
 use crate::error::{SrError, SrResult};
 use crate::vulkan_abstraction::descriptor_heap::slot::{
     DescriptorSlot, HeapKind, ResourceDescriptorKind, ResourceSection, SlotAllocator,
@@ -79,6 +81,12 @@ pub struct DescriptorHeap {
     min_sampler_reserved: u64,
     ext: ext::descriptor_heap::Device,
     device: ash::Device,
+    /// Slots whose owner has been dropped but which in-flight frames may still
+    /// reference through a recorded push constant. Returned to their allocators
+    /// by [`Self::process_pending_frees`] once the frame timeline proves no
+    /// submitted work can still read them. Ordered by `freed_at_frame`, which is
+    /// non-decreasing, so draining from the front is enough.
+    pending_free: VecDeque<(u64, DescriptorSlot)>,
 }
 
 impl DescriptorHeap {
@@ -218,6 +226,7 @@ impl DescriptorHeap {
             min_sampler_reserved,
             ext: ext.clone(),
             device: device.clone(),
+            pending_free: VecDeque::new(),
         })
     }
 
@@ -265,13 +274,35 @@ impl DescriptorHeap {
         }
     }
 
-    pub fn free(&mut self, slot: DescriptorSlot) {
-        match slot.kind {
-            HeapKind::Resource => {
-                let local = slot.index - self.resource.base_index(slot.section);
-                self.resource.alloc_mut(slot.section).free(local);
+    /// Retire `slot`. It is **not** reusable immediately: `freed_at_frame` is the
+    /// absolute frame counter at the time the owner was dropped, and the slot only
+    /// returns to its allocator once [`Self::process_pending_frees`] sees that frame
+    /// completed on the GPU.
+    ///
+    /// Immediate reuse would be a descriptor use-after-free. The allocator is LIFO,
+    /// so a slot released at the end of frame N was handed straight back at the start
+    /// of frame N+1 and overwritten by `vkWriteResourceDescriptorsEXT` while frame N
+    /// was still executing with that index baked into its push constants.
+    pub fn free(&mut self, slot: DescriptorSlot, freed_at_frame: u64) {
+        self.pending_free.push_back((freed_at_frame, slot));
+    }
+
+    /// Return slots retired at or before `completed_frame - MAX_FRAMES_IN_FLIGHT` to
+    /// their allocators. Call once per frame from the deferred-deallocation hook, with
+    /// the newest frame the GPU has reported complete.
+    pub fn process_pending_frees(&mut self, completed_frame: u64) {
+        while let Some(&(freed_at, slot)) = self.pending_free.front() {
+            if completed_frame < freed_at + MAX_FRAMES_IN_FLIGHT as u64 {
+                break;
             }
-            HeapKind::Sampler => self.sampler.alloc.free(slot.index),
+            match slot.kind {
+                HeapKind::Resource => {
+                    let local = slot.index - self.resource.base_index(slot.section);
+                    self.resource.alloc_mut(slot.section).free(local);
+                }
+                HeapKind::Sampler => self.sampler.alloc.free(slot.index),
+            }
+            self.pending_free.pop_front();
         }
     }
 

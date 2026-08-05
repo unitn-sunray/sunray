@@ -136,7 +136,9 @@ impl Swapchain {
         let present_modes = &device.surface_support_details().surface_present_modes;
         // Honor a caller-requested present mode when supported; otherwise pick the
         // lowest-latency mode available.
-        let present_mode = requested_present_mode
+        // `SUNRAY_PRESENT_MODE` outranks the caller — it is a diagnostic knob.
+        let present_mode = crate::utils::present_mode()
+            .or(requested_present_mode)
             .filter(|pm| present_modes.contains(pm))
             .unwrap_or_else(|| {
                 let present_mode = if present_modes.contains(&vk::PresentModeKHR::MAILBOX) {

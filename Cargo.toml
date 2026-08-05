@@ -62,7 +62,7 @@ raw-window-handle = { version = "0.6", optional = true }
 
 
 [features]
-default = [ ]
+default = [  ]
 nvidia-aftermath = ["dep:aftermath-rs"]
 # Enables `sunray::bevy_integration` (the Bevy plugin) and the `bevy_app` example.
 bevy = [

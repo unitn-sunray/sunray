@@ -96,7 +96,8 @@ impl SamplerParams {
 
 impl Drop for Sampler {
     fn drop(&mut self) {
-        self.core.descriptor_heap_mut().free(self.slot);
+        let freed_at = self.core.absolute_frame_count() as u64;
+        self.core.descriptor_heap_mut().free(self.slot, freed_at);
     }
 }
 

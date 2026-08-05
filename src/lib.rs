@@ -108,6 +108,7 @@ type EndOfFrameCallbacks<K> = Vec<(u64, Box<dyn FnOnce(&mut Renderer<K>) + Send>
 type ResizeCallbacks = Vec<Box<dyn FnMut((u32, u32)) + Send>>;
 
 /// Hook run after the graph has recorded but before present — see
+/// Do NOT use render graph resources cause they can't be correctly synchronized, this includes the resources which have been imported into the graph even if used without the handle unless you manually synchronize them.
 /// [`Renderer::render_to_swapchain_with`].
 pub type FinalizeFn<'a> = &'a mut dyn FnMut(&SwapchainFrame) -> SrResult<()>;
 
@@ -663,6 +664,12 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
                 i += 1;
             }
         }
+
+        // Descriptor slots retire on the same rule as everything else freed here: the
+        // callbacks above drop the resources, this hands their heap indices back once
+        // no in-flight frame can still reference them. Must run after the callbacks —
+        // a slot released by one of them is only queued, never reused, this frame.
+        self.core.descriptor_heap_mut().process_pending_frees(completed);
     }
 
     pub fn resize(&mut self, image_extent: (u32, u32)) -> SrResult<()> {
@@ -1418,6 +1425,33 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
         let rg = &mut self.render_graph;
         rg.reset();
 
+        // The post-process output is a per-target (per-swapchain-image) import, not
+        // a temporal resource — it changes with the destination image. Imported up
+        // front so it is the graph's output at every rung of the strip ladder below.
+        let postprocess_out_h = rg.import::<ImageDesc>(postprocess_out_arc);
+        let source_h = postprocess_out_h.clone();
+
+        // `SUNRAY_STRIP=N` builds only the first N stages and compiles what it has,
+        // leaving acquire → blit → present intact. The bisect for the driver crash in
+        // `docs/NVIDIA_DRIVER_CRASH_REPORT.md`: headless-with-no-present is stable and
+        // a bare present loop is stable, so the trigger is somewhere in between.
+        //
+        // ponytail: TEMPORARY — delete when the driver bug in `docs/NVIDIA_BUG_REPORT.md`
+        //           is fixed: drop `strip`, the `stop_after!` macro and all six
+        //           `stop_after!(N)` lines below, then `crate::utils::strip_stages` and
+        //           `STRIP_STAGES`. Unset behaves as `usize::MAX`, so deleting the calls
+        //           leaves exactly today's full pipeline — no other code changes.
+        let strip = crate::utils::strip_stages();
+        macro_rules! stop_after {
+            ($stage:expr) => {
+                if strip <= $stage {
+                    rg.compile()?;
+                    return Ok(source_h);
+                }
+            };
+        }
+        stop_after!(0);
+
         // Re-import the arena buffers into this fresh build
         let arena_handles = self.resource_manager.import_to_graph(rg);
         let arena_copies = self.resource_manager.take_queued_copies()?;
@@ -1457,6 +1491,8 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
             frame,
             Box::new(|renderer: &mut Renderer<K>| renderer.resource_manager.mark_tlas_built()),
         ));
+
+        stop_after!(1);
 
         let mk_img = |format: vk::Format, usage: vk::ImageUsageFlags, name: &'static str| ImageDesc {
             extent,
@@ -1500,10 +1536,6 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
         let [accum0_h, accum1_h] = rg.register_temporal_resource(&accumulation_temporal);
         let [denoise_a_h, denoise_b_h] = rg.register_temporal_resource(&denoising_temporal);
 
-        // The post-process output is a per-target (per-swapchain-image) import, not
-        // a temporal resource — it changes with the destination image.
-        let postprocess_out_h = rg.import::<ImageDesc>(postprocess_out_arc);
-
         // Reservoir ping-pong buffers re-registered for hazard tracking so the
         // graph emits the RIS→final hand-off barrier between the two RT passes
         // itself. The shader still reaches them by device-address (baked into
@@ -1539,6 +1571,7 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
             tlas_h.clone(),
             extent,
         )?;
+        stop_after!(2);
         Self::add_raytracing_final_pass(
             rg,
             final_shaders,
@@ -1553,6 +1586,7 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
             tlas_h,
             extent,
         )?;
+        stop_after!(3);
 
         // 2. Temporal accumulation.
         Self::add_temporal_pass(
@@ -1566,6 +1600,7 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
             width,
             height,
         )?;
+        stop_after!(4);
 
         // 3. Denoise (8 a-trous passes). Pass 0 reads the TAA output (accum_target).
         Self::add_denoise_passes(
@@ -1581,11 +1616,11 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
             width,
             height,
         )?;
+        stop_after!(5);
 
         // 4. Postprocess: read the final denoise output, tonemap into the output.
         let final_idx = ((DENOISE_PASSES - 1) % 2) as usize;
         let denoise_input_h = if final_idx == 0 { denoise_a_h } else { denoise_b_h };
-        let source_h = postprocess_out_h.clone();
         Self::add_postprocess_pass(
             rg,
             postprocess_spirv,

@@ -109,6 +109,13 @@ impl SlotAllocator {
 
     pub fn free(&mut self, index: u32) {
         debug_assert!(index < self.high_water);
+        // A double free hands the same index to two live resources, whose descriptors
+        // then clobber each other in the heap — silent, and a nightmare to trace back
+        // from the garbage the shader reads. O(n) scan, debug builds only.
+        debug_assert!(
+            !self.free_list.contains(&index),
+            "descriptor slot {index} freed twice: it is already on the free list"
+        );
         self.free_list.push(index);
     }
 }

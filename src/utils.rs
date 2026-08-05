@@ -34,6 +34,21 @@ pub(crate) const GRAPH_DUMP_DIR: &str = "SUNRAY_GRAPH_DUMP_DIR";
 /// much VRAM the render graph's transient resources take, never what is rendered.
 /// Parsed by [`AliasStrategy::from_env`](crate::render_graph::alias::AliasStrategy::from_env).
 pub(crate) const ALIAS_STRATEGY: &str = "SUNRAY_ALIAS_STRATEGY";
+/// Diagnostic bisect: keep only the first N stages of the unified graph, so a frame
+/// is still acquired, blitted and presented but does progressively less GPU work.
+/// Unset = the whole pipeline. See [`strip_stages`] for the ladder.
+///
+/// ponytail: TEMPORARY — scaffolding for the NVIDIA driver crash only, delete once
+///           the driver bug in `docs/NVIDIA_BUG_REPORT.md` is fixed. Removal is
+///           `STRIP_STAGES`, [`strip_stages`], the `stop_after!` macro and its six
+///           call sites in `Renderer::build_unified_graph`, and the README row.
+///           Nothing in the renderer depends on it: unset means "build everything".
+pub(crate) const STRIP_STAGES: &str = "SUNRAY_STRIP";
+/// Swapchain present mode override: `fifo`, `fifo_relaxed`, `mailbox`, `immediate`.
+/// Unset = the lowest-latency supported mode. Diagnostic knob — the NVIDIA driver
+/// crash in `docs/NVIDIA_DRIVER_CRASH_REPORT.md` involves the present worker thread,
+/// and the documented soak-stable runs were on `fifo`. See [`present_mode`].
+pub(crate) const PRESENT_MODE: &str = "SUNRAY_PRESENT_MODE";
 
 /// Where graph dumps land when the var is on but names no directory: `<crate>/debug`
 /// (git-ignored).
@@ -65,6 +80,56 @@ pub(crate) fn graph_dump_dir() -> Option<PathBuf> {
         "" | "0" | "false" | "off" | "no" => None,
         "1" | "true" | "on" | "yes" => Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_GRAPH_DUMP_DIR)),
         _ => Some(PathBuf::from(raw)),
+    }
+}
+
+/// How many stages of the unified graph to build, from the front:
+///
+/// | value | graph contains |
+/// |---|---|
+/// | 0 | nothing — acquire, blit the (unwritten) output, present |
+/// | 1 | + staging copies and the BLAS / TLAS builds |
+/// | 2 | + the RIS ray-tracing pass |
+/// | 3 | + the final-shading ray-tracing pass |
+/// | 4 | + temporal accumulation |
+/// | 5 | + the a-trous denoise passes |
+/// | unset / ≥6 | + postprocess, i.e. the real frame |
+///
+/// A ladder rather than an on/off flag because the point is to find the lowest rung
+/// that still reproduces the driver crash in `docs/NVIDIA_DRIVER_CRASH_REPORT.md`.
+/// Levels below 6 render garbage by construction — the blit source is never written,
+/// which is also why they trip `VUID-VkImageMemoryBarrier2-newLayout-01198`. Only
+/// rung 6 (the real frame) is validation-clean.
+///
+/// ponytail: TEMPORARY — see [`STRIP_STAGES`] for what to delete when the driver
+///           bug is fixed.
+pub(crate) fn strip_stages() -> usize {
+    let Ok(raw) = std::env::var(STRIP_STAGES) else {
+        return usize::MAX;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(n) => n,
+        Err(_) if raw.trim().is_empty() => usize::MAX,
+        Err(_) => {
+            log::warn!("{STRIP_STAGES}: expected a non-negative integer, got {raw:?} — building the full graph");
+            usize::MAX
+        }
+    }
+}
+
+/// [`PRESENT_MODE`] override, or `None` to let the swapchain pick.
+pub(crate) fn present_mode() -> Option<vk::PresentModeKHR> {
+    let raw = std::env::var(PRESENT_MODE).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => None,
+        "fifo" => Some(vk::PresentModeKHR::FIFO),
+        "fifo_relaxed" => Some(vk::PresentModeKHR::FIFO_RELAXED),
+        "mailbox" => Some(vk::PresentModeKHR::MAILBOX),
+        "immediate" => Some(vk::PresentModeKHR::IMMEDIATE),
+        other => {
+            log::warn!("{PRESENT_MODE}: unrecognized value {other:?} (expected fifo/fifo_relaxed/mailbox/immediate) — ignoring");
+            None
+        }
     }
 }
 

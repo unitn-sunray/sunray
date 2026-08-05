@@ -73,6 +73,11 @@ pub enum AliasStrategy {
     Slot,
     /// Offset packing: lifetime-disjoint resources share a bucket's byte range.
     Bucket,
+    /// No aliasing: one bucket per resource. Wastes memory on purpose — it is the
+    /// bisect knob for "is this corruption the aliasing?". No two resources share a
+    /// byte, so `alias_predecessors` finds nothing and no aliasing barrier is
+    /// emitted; if a bug survives this, it is not an aliasing bug.
+    Off,
 }
 
 impl AliasStrategy {
@@ -82,12 +87,12 @@ impl AliasStrategy {
             return Self::Slot;
         };
         match raw.trim().to_ascii_lowercase().as_str() {
-            "" => Self::Slot,
-            "slot" => Self::Slot,
+            "" | "slot" => Self::Slot,
             "bucket" => Self::Bucket,
+            "off" | "none" => Self::Off,
             other => {
                 log::warn!(
-                    "{}: unrecognized value {other:?} (expected `slot` or `bucket`) — using `slot`",
+                    "{}: unrecognized value {other:?} (expected `slot`, `bucket` or `off`) — using `slot`",
                     crate::utils::ALIAS_STRATEGY
                 );
                 Self::Slot
@@ -133,10 +138,31 @@ pub fn plan(
         match strategy {
             AliasStrategy::Slot => plan_slots(&mut members, &mut placements, &mut buckets),
             AliasStrategy::Bucket => plan_buckets(&mut members, granularity, &mut placements, &mut buckets),
+            AliasStrategy::Off => plan_off(&members, &mut placements, &mut buckets),
         }
     }
 
     (placements, buckets)
+}
+
+/// One bucket per resource — aliasing disabled. Order-independent, so no sort.
+fn plan_off(members: &[&AliasResource], placements: &mut HashMap<u32, Placement>, buckets: &mut Vec<BucketReqs>) {
+    for r in members {
+        placements.insert(
+            r.id,
+            Placement {
+                bucket: buckets.len() as u32,
+                offset: 0,
+                size: r.size,
+            },
+        );
+        buckets.push(BucketReqs {
+            size: r.size,
+            alignment: r.alignment,
+            memory_type_bits: r.memory_type_bits,
+            location: r.location,
+        });
+    }
 }
 
 /// Greedy interval-graph coloring, earliest-start first, first fit. This is the
@@ -556,7 +582,7 @@ mod tests {
         for seed in 0..32u64 {
             let (resources, components) = gen_resources(seed, &params);
             for granularity in [1, 64, 1024] {
-                for strategy in [AliasStrategy::Slot, AliasStrategy::Bucket] {
+                for strategy in [AliasStrategy::Slot, AliasStrategy::Bucket, AliasStrategy::Off] {
                     let (placements, buckets) = plan(strategy, &resources, &components, granularity);
                     check_invariants(
                         &resources,

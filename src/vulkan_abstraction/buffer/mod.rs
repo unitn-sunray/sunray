@@ -324,12 +324,13 @@ impl Drop for RawBuffer {
     fn drop(&mut self) {
         if self.buffer != vk::Buffer::null() {
             {
+                let freed_at = self.core.absolute_frame_count() as u64;
                 let mut heap = self.core.descriptor_heap_mut();
                 if let Some(s) = *self.uniform_slot.lock() {
-                    heap.free(s);
+                    heap.free(s, freed_at);
                 }
                 if let Some(s) = *self.storage_slot.lock() {
-                    heap.free(s);
+                    heap.free(s, freed_at);
                 }
             }
 

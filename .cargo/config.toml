@@ -9,7 +9,9 @@ SUNRAY_SERIALIZE_FRAMES = "1"
 # `1` dumps the per-frame render graph into <crate>/debug (git-ignored); `0` = off.
 SUNRAY_GRAPH_DUMP_DIR = "0"
 RUST_BACKTRACE = "1"
-SUNRAY_ENABLE_GPUAV = "1"
+SUNRAY_ENABLE_GPUAV = "0"
+SUNRAY_ALIAS_STRATEGY="bucket"
+SUNRAY_ENABLE_NVIDIA_AFTERMATH="0"
 #SUNRAY_ALIAS_STRATEGY="bucket"
 # `-dbg` variants build the dev profile (debug assertions + symbols, slow);
 # the plain ones are release. Nothing else differs.
