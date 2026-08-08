@@ -23,6 +23,8 @@ use std::sync::Arc;
 use vk_sync_fork as vk_sync;
 use vk_sync_fork::AccessType;
 
+//TODO when I import previous usages, I should remove usages after FRAME_IN_FLIGHT so that I don't make a mask for reads that come from already executed frames
+
 #[derive(Copy, Clone, Debug)]
 //TODO this is basically unused or misused
 pub enum PassResourceAccessSyncType {
@@ -324,6 +326,7 @@ pub(crate) struct PassAnalysis {
 /// random benchmarks exercise this scan rather than a reimplementation of it.
 pub(crate) fn analyze_passes<'a>(passes: impl ExactSizeIterator<Item = (&'a [ResourceRef], &'a [ResourceRef])>) -> PassAnalysis {
     let pass_count = passes.len();
+    //TODO possibile creazione con with size
     let mut resource_usages: BTreeMap<u32, ResourceLifetimeUsage> = BTreeMap::new();
     let mut hazard_states: HashMap<u32, ResourceHazardState> = HashMap::new();
 
@@ -1452,7 +1455,7 @@ impl RenderGraph {
                     // offset packing a resource can land on top of several smaller
                     // ones side by side, so a single predecessor is not enough.
                     //
-                    // ponytail: unioned without pruning. A predecessor whose bytes
+                    // TODO: unioned without pruning. A predecessor whose bytes
                     // are fully covered by a later-ending one contributes a
                     // redundant source access — wider than necessary, never
                     // narrower. Prune by coverage if barriers get fat.
