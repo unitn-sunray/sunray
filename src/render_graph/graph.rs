@@ -282,6 +282,7 @@ struct AccessEpoch {
 /// write — it must not merge into a neighbouring read run, and the first real use
 /// must be ordered after it. `__imports` routes it to the write list for the same
 /// reason (`PassCommonDataBuilder::declare_previous_imports`).
+#[inline]
 fn starts_write_epoch(access: vk_sync::AccessType) -> bool {
     access.is_write_access() || access == vk_sync::AccessType::Nothing
 }

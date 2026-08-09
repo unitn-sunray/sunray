@@ -415,7 +415,6 @@ impl TransientResources {
     ///
     /// Queue family transfer is `IGNORED` on both sides — we're single-queue.
     ///
-    /// TODO this is currently doing a 1 resource barriers to 1 actual barrier, this can be reduced to 1 barrier per image layout transition and a global barrier for the other stuff, this doesn't add any involuntary sync since I have already built the dependencies graph
     pub(crate) fn emit_barriers(&self, device: &ash::Device, cmd_buffer: vk::CommandBuffer, barriers: &[ResourceBarrier]) {
         if barriers.is_empty() {
             return;
