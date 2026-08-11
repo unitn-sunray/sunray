@@ -1206,21 +1206,6 @@ impl RenderGraph {
             (common.read.as_slice(), common.write.as_slice())
         }));
 
-        // Cross-frame sync for temporal (ping-pong / history) resources: thread
-        // each backing's end access this frame back into its stored import, so
-        // *next* frame's compile emits the read→write (or write→read) barrier for
-        // the same physical backing across the frame boundary. Without this the
-        // imports always re-enter as `Nothing` and the hazard graph — which only
-        // orders passes *within* one compile — never synchronizes the ping-pong
-        // reuse, leaving frame N's reservoir/accumulation write unordered against
-        // frame N+1's read of the same memory. The TLAS gets this treatment
-        // explicitly via `Tlas::queue_build`; temporal resources get it here.
-        for &(ti, ci, rid) in &self.registered_temporal {
-            if let Some(end) = self.resource_end_states.get(&rid) {
-                set_import_access(&mut self.temporal_resources[ti].imports[ci], &end.end_accesses);
-            }
-        }
-
         self.transient_resources[slot].populate(
             Arc::clone(&self.core),
             &self.virtual_resources,
@@ -1247,6 +1232,25 @@ impl RenderGraph {
             &self.transient_resources[slot].placements,
         );
         self.resource_end_states = end_states;
+
+        // Cross-frame sync for temporal (ping-pong / history) resources: thread
+        // each backing's end access this frame back into its stored import, so
+        // *next* frame's compile emits the read→write (or write→read) barrier for
+        // the same physical backing across the frame boundary. Without this the
+        // imports always re-enter as `Nothing` and the hazard graph — which only
+        // orders passes *within* one compile — never synchronizes the ping-pong
+        // reuse, leaving frame N's reservoir/accumulation write unordered against
+        // frame N+1's read of the same memory. The TLAS gets this treatment
+        // explicitly via `Tlas::queue_build`; temporal resources get it here.
+        //
+        // Must run *after* `plan_barriers`: `reset` clears `resource_end_states`
+        // every frame, so reading it before the epoch walk repopulates it always
+        // found an empty map and the write-back silently never happened.
+        for &(ti, ci, rid) in &self.registered_temporal {
+            if let Some(end) = self.resource_end_states.get(&rid) {
+                set_import_access(&mut self.temporal_resources[ti].imports[ci], &end.end_accesses);
+            }
+        }
 
         let device = self.core.device().inner().clone();
         // This slot's command buffer was allocated in `RenderGraph::new`. Reset it
@@ -1705,6 +1709,7 @@ impl RenderGraph {
         let dump = GraphDump {
             frame: self.core.absolute_frame_count() as u64,
             pass_names: pass_names.to_vec(),
+            pass_uses: self.passes.iter().map(|p| (p.common().read.as_slice(), p.common().write.as_slice())).collect(),
             edges,
             resources,
             // The record loop already collected every barrier it issued, in

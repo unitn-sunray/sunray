@@ -6,8 +6,11 @@
 //! [`super::transient_resources`] turns `vk::MemoryRequirements` into
 //! [`AliasResource`]s, calls [`plan`], and binds the result.
 //!
-//! Two strategies, selected by `SUNRAY_ALIAS_STRATEGY`:
+//! Three strategies, selected by `SUNRAY_ALIAS_STRATEGY`:
 //!
+//! * [`AliasStrategy::Off`] — no aliasing at all: one bucket per resource. The
+//!   control both others are measured against, and the bisect knob for "is this
+//!   corruption the aliasing?".
 //! * [`AliasStrategy::Slot`] — greedy interval-graph coloring. Every member of a
 //!   bucket sits at offset 0 and the bucket is `max(member sizes)`, so two members
 //!   never co-occupy. Simple and fast, but a 4 MiB scratch buffer folded into a
@@ -377,7 +380,7 @@ pub fn live_bytes_lower_bound(resources: &[AliasResource]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render_graph::bench_support::{GenParams, gen_resources};
+    use crate::render_graph::bench_support::{GenParams, gen_graph, gen_resources};
 
     const GPU: MemoryLocation = MemoryLocation::GpuOnly;
 
@@ -614,8 +617,11 @@ mod tests {
         );
     }
 
-    /// Memory-quality comparison. Criterion measures time; this measures the thing
-    /// that actually decides whether the bucket algorithm is worth its complexity.
+    /// Memory-quality comparison. Criterion measures time; this measures the two
+    /// things that actually decide whether the bucket algorithm is worth its
+    /// complexity: bytes allocated against the concurrently-live lower bound, and
+    /// the barrier count the resulting placement costs (denser packing means more
+    /// sequential byte reuse, and every reuse needs an aliasing barrier).
     ///
     /// `cargo test alias_quality_report -- --ignored --nocapture`
     #[test]
@@ -624,8 +630,8 @@ mod tests {
         let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
         println!();
         println!(
-            "{:<8} {:>6} {:>8} {:>10} {:>10} {:>8}",
-            "strategy", "res", "buckets", "GiB", "optimum", "ratio"
+            "{:<8} {:>6} {:>8} {:>10} {:>10} {:>8} {:>9}",
+            "strategy", "res", "buckets", "GiB", "optimum", "ratio", "barriers"
         );
         for resources_n in [64usize, 256, 1024, 4096] {
             let params = GenParams {
@@ -633,22 +639,21 @@ mod tests {
                 passes: resources_n / 4,
                 ..GenParams::default()
             };
-            let (r, c) = gen_resources(7, &params);
-            let optimum = live_bytes_lower_bound(&r);
-            for strategy in [AliasStrategy::Slot, AliasStrategy::Bucket] {
-                let start = std::time::Instant::now();
-                let (_, buckets) = plan(strategy, &r, &c, 64);
-                let elapsed = start.elapsed();
+            let fixture = gen_graph(7, &params);
+            let (r, c) = fixture.alias_input();
+            let optimum = live_bytes_lower_bound(r);
+            for strategy in [AliasStrategy::Off, AliasStrategy::Slot, AliasStrategy::Bucket] {
+                let (placements, buckets) = plan(strategy, r, c, 64);
                 let total = total_bytes(&buckets);
                 println!(
-                    "{:<8} {:>6} {:>8} {:>10.2} {:>10.2} {:>7.0}%   {:?}",
+                    "{:<8} {:>6} {:>8} {:>10.2} {:>10.2} {:>7.0}% {:>9}",
                     format!("{strategy:?}").to_lowercase(),
                     resources_n,
                     buckets.len(),
                     gib(total),
                     gib(optimum),
                     100.0 * total as f64 / optimum.max(1) as f64,
-                    elapsed
+                    fixture.run_plan_barriers(&placements),
                 );
             }
         }

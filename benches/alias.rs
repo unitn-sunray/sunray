@@ -32,7 +32,7 @@ fn bench_plan(c: &mut Criterion) {
     for n in SIZES {
         let fixture = gen_graph(SEED, &params(n));
         let (resources, components) = fixture.alias_input();
-        for strategy in [AliasStrategy::Slot, AliasStrategy::Bucket] {
+        for strategy in [AliasStrategy::Off, AliasStrategy::Slot, AliasStrategy::Bucket] {
             let id = BenchmarkId::new(format!("{strategy:?}").to_lowercase(), n);
             group.bench_function(id, |b| {
                 b.iter(|| alias::plan(strategy, black_box(resources), black_box(components), 64))
@@ -54,7 +54,7 @@ fn bench_graph(c: &mut Criterion) {
         // Barrier planning reads the placement, so it is benchmarked under both —
         // `Bucket` puts more resources in each bucket, which widens the alias
         // predecessor sets the planner has to union.
-        for strategy in [AliasStrategy::Slot, AliasStrategy::Bucket] {
+        for strategy in [AliasStrategy::Off, AliasStrategy::Slot, AliasStrategy::Bucket] {
             let (placements, _) = alias::plan(strategy, resources, components, 64);
             let id = BenchmarkId::new(format!("plan_barriers/{strategy:?}").to_lowercase(), n);
             group.bench_function(id, |b| b.iter(|| fixture.run_plan_barriers(black_box(&placements))));

@@ -397,7 +397,7 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
                                 next_frame += 1;
                             }
                             Err(vk::Result::TIMEOUT) => {
-                                log::debug!("frame watcher: timeout waiting graph timeline for frame {next_frame}");
+                                log::trace!("frame watcher: timeout waiting graph timeline for frame {next_frame}");
                                 continue;
                             }
                             Err(e) => {

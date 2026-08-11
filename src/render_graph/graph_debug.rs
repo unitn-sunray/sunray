@@ -1,12 +1,19 @@
 //! Structured dump of a compiled render-graph frame for offline visualization.
 //!
 //! Emitted once per frame into `$SUNRAY_GRAPH_DUMP_DIR` (set it to a directory,
-//! or to `1` to use `<crate>/debug`; unset = zero cost). Two files per frame:
-//!   - `graph_frame_<n>.dot` — Graphviz: passes as nodes, dependency edges
-//!     labeled with the barriers they carry, plus a `FRAME_ENTRY` node holding
-//!     the init / cross-frame barriers. Render with `dot -Tsvg`.
-//!   - `graph_frame_<n>.txt` — the resource table (kind / size / `bucket@offset` /
-//!     **imported cross-frame access**) and the transient aliasing report.
+//! or to `1` to use `<crate>/debug`; unset = zero cost). Three files per frame:
+//!   - `graph_frame_<n>.dot` — Graphviz: passes as nodes listing every resource
+//!     they read/write, dependency edges, and a note node per barrier point.
+//!   - `graph_frame_<n>.svg` — the above rendered, if Graphviz's `dot` is on
+//!     `PATH`. No `dot`, no `.svg`; nothing else changes.
+//!   - `graph_frame_<n>.txt` — the resource table (kind / size / live pass range /
+//!     `bucket@offset` / **imported cross-frame access**) and the aliasing report.
+//!
+//! Resources read as `res<id>` when the graph owns them (transient — freed at
+//! frame end, memory may be aliased to another transient) and `ext<id>` when they
+//! are imported (external — outlives the frame). A pass's usage line is tagged
+//! `<-- first use` / `<-- last use` where that pass bounds the resource's live
+//! range, which for a transient is exactly the window the aliaser packs against.
 //!
 //! The cross-frame access column shows the access each imported resource is
 //! declared to carry into the frame by the `__imports` node (see
@@ -18,12 +25,14 @@
 //! a resource needs its end state threaded back in via
 //! `RenderGraph::import_with_usage`.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use vk_sync_fork as vk_sync;
 
 use crate::render_graph::alias::Placement;
 use crate::render_graph::graph::ResourceBarrier;
+use crate::render_graph::resource::ResourceRef;
 
 /// One row of the per-frame resource table.
 pub(crate) struct ResourceDumpInfo {
@@ -44,6 +53,8 @@ pub(crate) struct ResourceDumpInfo {
 pub(crate) struct GraphDump<'a> {
     pub frame: u64,
     pub pass_names: Vec<String>,
+    /// `(read, write)` declarations of each pass, parallel to `pass_names`.
+    pub pass_uses: Vec<(&'a [ResourceRef], &'a [ResourceRef])>,
     /// (src_pass, dst_pass, resources whose hazards forced the ordering).
     /// Edges express ordering only — barriers belong to a schedule position, not
     /// to an edge, so they live in `barriers_at`.
@@ -56,11 +67,26 @@ pub(crate) struct GraphDump<'a> {
 }
 
 impl GraphDump<'_> {
+    /// `res<id>` for a graph-owned transient, `ext<id>` for an imported external —
+    /// the prefix answers "does this outlive the frame?" without a table lookup.
     fn res_label(&self, id: u32) -> String {
         match self.resources.iter().find(|r| r.id == id) {
+            Some(r) if r.kind.starts_with("imported") => format!("ext{} {}", id, r.detail),
             Some(r) => format!("res{} {}", id, r.detail),
             None => format!("res{id}"),
         }
+    }
+
+    /// First and last pass touching each resource, by id. Passes are visited in
+    /// schedule order, so the last write wins for the end of the span.
+    fn lifetimes(&self) -> HashMap<u32, (usize, usize)> {
+        let mut spans: HashMap<u32, (usize, usize)> = HashMap::new();
+        for (pass, (read, write)) in self.pass_uses.iter().enumerate() {
+            for r in read.iter().chain(write.iter()) {
+                spans.entry(r.id).and_modify(|s| s.1 = pass).or_insert((pass, pass));
+            }
+        }
+        spans
     }
 
     fn barrier_label(&self, b: &ResourceBarrier) -> String {
@@ -73,16 +99,50 @@ impl GraphDump<'_> {
         )
     }
 
+    /// `R`/`W` + resource + declared access, one entry per resource a pass touches,
+    /// tagged where this pass is the resource's first or last use in the frame —
+    /// for a transient that span is exactly the window its memory must stay live.
+    fn use_labels(&self, pass: usize, spans: &HashMap<u32, (usize, usize)>) -> Vec<String> {
+        let (read, write) = self.pass_uses[pass];
+        read.iter()
+            .map(|r| ('R', r))
+            .chain(write.iter().map(|w| ('W', w)))
+            .map(|(rw, r)| {
+                let span = match spans.get(&r.id) {
+                    Some(&(f, l)) if f == l => " <-- only use",
+                    Some(&(f, _)) if f == pass => " <-- first use",
+                    Some(&(_, l)) if l == pass => " <-- last use",
+                    _ => "",
+                };
+                format!("{rw} {} [{:?}]{span}", self.res_label(r.id), r.access.access_type)
+            })
+            .collect()
+    }
+
     /// Graphviz DOT of passes + dependency edges + a frame-entry node.
     pub(crate) fn to_dot(&self) -> String {
         let mut s = String::new();
         let _ = writeln!(s, "digraph render_graph_frame_{} {{", self.frame);
-        let _ = writeln!(s, "  rankdir=LR;");
+        // TB: a 30+ pass chain laid out LR is a mile-wide strip nothing can read.
+        let _ = writeln!(s, "  rankdir=TB;");
         let _ = writeln!(s, "  node [shape=box, style=rounded, fontname=\"monospace\"];");
         let _ = writeln!(s, "  edge [fontname=\"monospace\", fontsize=9];");
+        let _ = writeln!(
+            s,
+            "  legend [shape=plaintext, label=\"res<id> = transient (graph-owned, may alias)\\l\
+             ext<id> = external (imported, outlives the frame)\\l\
+             R / W   = declared read / write\\l\
+             first/last use = the transient's live range\\l\"];"
+        );
 
+        let spans = self.lifetimes();
         for (i, name) in self.pass_names.iter().enumerate() {
-            let _ = writeln!(s, "  pass_{i} [label=\"pass {i}\\n{}\"];", escape(name));
+            // `\l` = left-aligned line break, so the usage list reads as a column.
+            let mut lbl = format!("pass {i}: {}\\l", escape(name));
+            for u in self.use_labels(i, &spans) {
+                let _ = write!(lbl, "{}\\l", escape(&u));
+            }
+            let _ = writeln!(s, "  pass_{i} [label=\"{lbl}\"];");
         }
 
         // Barriers hang off the pass they precede, not off an edge — one note node
@@ -102,9 +162,11 @@ impl GraphDump<'_> {
             let _ = writeln!(s, "  barrier_{pass} -> pass_{pass} [style=dashed, color=\"#b38f00\"];");
         }
 
-        for (src, dst, resources) in &self.edges {
-            let label = resources.iter().map(|r| self.res_label(*r)).collect::<Vec<_>>().join("\\n");
-            let _ = writeln!(s, "  pass_{src} -> pass_{dst} [label=\"{}\"];", escape(&label));
+        // Edges are unlabeled: the resources that forced each ordering are listed
+        // per pass in the node labels, and per edge in the .txt dump. Repeating
+        // them on the edges made the layout unreadably wide.
+        for (src, dst, _) in &self.edges {
+            let _ = writeln!(s, "  pass_{src} -> pass_{dst};");
         }
         let _ = writeln!(s, "}}");
         s
@@ -114,12 +176,16 @@ impl GraphDump<'_> {
     pub(crate) fn to_text(&self) -> String {
         let mut s = String::new();
         let _ = writeln!(s, "=== Render graph frame {} ===", self.frame);
-        let _ = writeln!(s, "\nPasses:");
+        let spans = self.lifetimes();
+        let _ = writeln!(s, "\nPasses (res<id> = transient, ext<id> = external/imported):");
         for (i, name) in self.pass_names.iter().enumerate() {
             let _ = writeln!(s, "  pass {i}: {name}");
+            for u in self.use_labels(i, &spans) {
+                let _ = writeln!(s, "      {u}");
+            }
         }
 
-        let _ = writeln!(s, "\nResources (id | kind | detail | bucket@offset | cross-frame access):");
+        let _ = writeln!(s, "\nResources (id | kind | detail | live passes | bucket@offset | cross-frame access):");
         for r in &self.resources {
             // `bucket@offset` — under SUNRAY_ALIAS_STRATEGY=bucket several resources
             // share a bucket at once, so the offset is what distinguishes them.
@@ -127,6 +193,12 @@ impl GraphDump<'_> {
                 .placement
                 .map(|p| format!("{}@{}", p.bucket, p.offset))
                 .unwrap_or_else(|| "-".into());
+            // For a transient this span is the window its memory must stay live,
+            // i.e. what the aliaser packs against.
+            let live = match spans.get(&r.id) {
+                Some((f, l)) => format!("{f}..{l}"),
+                None => "unused".into(),
+            };
             match &r.import_access {
                 Some(accesses) => {
                     let flag = if accesses.iter().all(|a| *a == vk_sync::AccessType::Nothing) {
@@ -136,12 +208,16 @@ impl GraphDump<'_> {
                     };
                     let _ = writeln!(
                         s,
-                        "  {:>3} | {:<16} | {:<28} | {:<16} | {:?}{}",
-                        r.id, r.kind, r.detail, slot, accesses, flag
+                        "  {:>3} | {:<16} | {:<28} | {:<8} | {:<16} | {:?}{}",
+                        r.id, r.kind, r.detail, live, slot, accesses, flag
                     );
                 }
                 None => {
-                    let _ = writeln!(s, "  {:>3} | {:<16} | {:<28} | {:<16} | -", r.id, r.kind, r.detail, slot);
+                    let _ = writeln!(
+                        s,
+                        "  {:>3} | {:<16} | {:<28} | {:<8} | {:<16} | -",
+                        r.id, r.kind, r.detail, live, slot
+                    );
                 }
             }
         }
@@ -188,6 +264,16 @@ impl GraphDump<'_> {
         }
         if let Err(e) = std::fs::write(format!("{base}.txt"), self.to_text()) {
             log::warn!("graph dump: failed to write {base}.txt: {e}");
+        }
+        // Render the .dot if Graphviz is installed; no dot on PATH just means no
+        // .svg, which is why the failure is a debug line and not a warning.
+        match std::process::Command::new("dot")
+            .args(["-Tsvg", &format!("{base}.dot"), "-o", &format!("{base}.svg")])
+            .status()
+        {
+            Ok(s) if s.success() => {}
+            Ok(s) => log::warn!("graph dump: dot -Tsvg exited {s}"),
+            Err(e) => log::debug!("graph dump: no .svg ({e})"),
         }
     }
 }
