@@ -185,7 +185,10 @@ impl GraphDump<'_> {
             }
         }
 
-        let _ = writeln!(s, "\nResources (id | kind | detail | live passes | bucket@offset | cross-frame access):");
+        let _ = writeln!(
+            s,
+            "\nResources (id | kind | detail | live passes | bucket@offset | cross-frame access):"
+        );
         for r in &self.resources {
             // `bucket@offset` — under SUNRAY_ALIAS_STRATEGY=bucket several resources
             // share a bucket at once, so the offset is what distinguishes them.

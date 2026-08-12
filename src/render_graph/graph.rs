@@ -1272,7 +1272,9 @@ impl RenderGraph {
         // `mark_output` keeps today's behaviour (everything runs) instead of
         // compiling an empty frame.
         if outputs.is_empty() && temporal.is_empty() {
-            log::error!("render graph: There exists no output nodes, dead pass culling skipped. If not the graph would have been empty.");
+            log::error!(
+                "render graph: There exists no output nodes, dead pass culling skipped. If not the graph would have been empty."
+            );
             return;
         }
 
@@ -1853,7 +1855,11 @@ impl RenderGraph {
         let dump = GraphDump {
             frame: self.core.absolute_frame_count() as u64,
             pass_names: pass_names.to_vec(),
-            pass_uses: self.passes.iter().map(|p| (p.common().read.as_slice(), p.common().write.as_slice())).collect(),
+            pass_uses: self
+                .passes
+                .iter()
+                .map(|p| (p.common().read.as_slice(), p.common().write.as_slice()))
+                .collect(),
             edges,
             resources,
             // The record loop already collected every barrier it issued, in
@@ -2771,7 +2777,12 @@ mod tests {
 
     /// `(reads, writes)` per pass → the liveness mask, with no internal prefix and
     /// no temporal resources unless the test says otherwise.
-    fn cull(decls: &[(Vec<ResourceRef>, Vec<ResourceRef>)], outputs: &[u32], temporal: &[u32], internal_count: usize) -> Vec<bool> {
+    fn cull(
+        decls: &[(Vec<ResourceRef>, Vec<ResourceRef>)],
+        outputs: &[u32],
+        temporal: &[u32],
+        internal_count: usize,
+    ) -> Vec<bool> {
         let analysis = analyze_passes(decls.iter().map(|(r, w)| (r.as_slice(), w.as_slice())));
         live_passes(
             decls.iter().map(|(_, w)| w.as_slice()),
@@ -2850,7 +2861,8 @@ mod tests {
 
         // Live: writes the frame's declared result.
         let mut live = PassCommonDataBuilder::new(&mut rg, "live");
-        live.write(&img_a, vk_sync::AccessType::ComputeShaderWrite).expect("live write");
+        live.write(&img_a, vk_sync::AccessType::ComputeShaderWrite)
+            .expect("live write");
         {
             let fired = Arc::clone(&fired);
             live.render(move |_cb, _tr| {
