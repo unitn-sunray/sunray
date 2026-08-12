@@ -119,6 +119,17 @@ impl TransientResources {
                 GraphResourceInfo::Created(desc) => desc,
                 GraphResourceInfo::Imported(_) => continue,
             };
+            // No usage means no lifetime to pack against, and nobody to read it:
+            // a `create_resource` that was never wired into a pass, or one whose
+            // only users dead-pass culling just removed. Skipping it here — rather
+            // than after `create_unbound` — is what keeps every later phase
+            // (aliasing, binding) able to assume a placement exists. Only the
+            // aliased kinds are affected; a sampler carries no memory and is still
+            // materialized so its heap slot stays valid however it is reached.
+            let aliased = matches!(desc, GraphResourceDesc::Image(_) | GraphResourceDesc::Buffer(_));
+            if aliased && !usages.contains_key(&res_id) {
+                continue;
+            }
             match desc {
                 GraphResourceDesc::Image(image_desc) => {
                     let (handle, reqs) = Image::create_unbound(

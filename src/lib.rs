@@ -1432,6 +1432,10 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
         // a temporal resource — it changes with the destination image. Imported up
         // front so it is the graph's output at every rung of the strip ladder below.
         let postprocess_out_h = rg.import::<ImageDesc>(postprocess_out_arc);
+        // This is the frame's result — the image `run_present` blits from. Everything
+        // that does not transitively feed it (or a temporal backing) is culled by
+        // `compile`. Marked here so every `stop_after!` rung below is self-consistent.
+        rg.mark_output(&postprocess_out_h);
         let source_h = postprocess_out_h.clone();
 
         // `SUNRAY_STRIP=N` builds only the first N stages and compiles what it has,

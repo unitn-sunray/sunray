@@ -17,7 +17,7 @@ use crate::vulkan_abstraction::{
 };
 use ash::vk;
 use petgraph::visit::EdgeRef;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use vk_sync_fork as vk_sync;
@@ -317,6 +317,11 @@ pub(crate) struct PassAnalysis {
     pub(crate) resource_usages: BTreeMap<u32, ResourceLifetimeUsage>,
     pub(crate) dep_graph: petgraph::graph::DiGraph<usize, PassDependency>,
     pub(crate) components: Vec<PassComponent>,
+    /// Per pass, the passes that wrote the data it reads (read-after-write only).
+    /// A strict subset of `dep_graph`'s incoming edges, which also carry WAR/WAW
+    /// ordering — those point *dead reader → live writer*, so [`live_passes`]
+    /// must not follow them or a dead pass resurrects itself.
+    pub(crate) raw_producers: Vec<Vec<usize>>,
 }
 
 /// Single linear walk over the passes in declaration order, building lifetimes and
@@ -333,6 +338,7 @@ pub(crate) fn analyze_passes<'a>(passes: impl ExactSizeIterator<Item = (&'a [Res
 
     let mut dep_graph = petgraph::graph::DiGraph::<usize, PassDependency>::with_capacity(pass_count, pass_count * 2);
     let pass_nodes: Vec<petgraph::graph::NodeIndex> = (0..pass_count).map(|i| dep_graph.add_node(i)).collect();
+    let mut raw_producers: Vec<Vec<usize>> = vec![Vec::new(); pass_count];
 
     for (pass_id, (read, write)) in passes.enumerate() {
         for read in read {
@@ -341,6 +347,11 @@ pub(crate) fn analyze_passes<'a>(passes: impl ExactSizeIterator<Item = (&'a [Res
             let state = hazard_states.entry(res_id).or_default();
             if let Some((w_pass, _)) = state.last_writer {
                 add_dep_edge(&mut dep_graph, &pass_nodes, w_pass, pass_id, res_id);
+                // Same condition as the RAW edge above, minus the self-edge case
+                // (a pass reading its own write depends on nothing external).
+                if w_pass != pass_id && !raw_producers[pass_id].contains(&w_pass) {
+                    raw_producers[pass_id].push(w_pass);
+                }
             }
 
             state.readers_since_write.push((pass_id, read.access.access_type));
@@ -402,7 +413,57 @@ pub(crate) fn analyze_passes<'a>(passes: impl ExactSizeIterator<Item = (&'a [Res
         resource_usages,
         dep_graph,
         components,
+        raw_producers,
     }
+}
+
+/// Backward reachability from the frame's declared results: `live[i]` is false for
+/// every pass that cannot reach one and is therefore never recorded.
+///
+/// Roots are, in order of the checks below:
+///   * the graph-synthesized prefix `0..internal_count` — `__imports` seeds every
+///     import's incoming access, and `__prologue_copies` carries staging uploads
+///     whose sources were already taken from the arena, so losing it loses the
+///     upload for good (see `RenderGraph::build_internal_passes`);
+///   * any pass writing a resource in `outputs` — `RenderGraph::mark_output`, plus
+///     the writes of passes flagged by `PassCommonDataBuilder::mark_output`;
+///   * any pass writing a temporal (history / ping-pong) backing. Those are read
+///     by the *next* frame, which a single compile cannot see.
+///
+/// ponytail: temporal writes are rooted unconditionally rather than proven live
+/// across frames — a cross-frame fixpoint would be the exact answer, and is worth
+/// it only if history chains ever become optional.
+pub(crate) fn live_passes(
+    writes: impl ExactSizeIterator<Item = impl AsRef<[ResourceRef]>>,
+    raw_producers: &[Vec<usize>],
+    outputs: &HashSet<u32>,
+    temporal: &HashSet<u32>,
+    internal_count: usize,
+) -> Vec<bool> {
+    let mut live = vec![false; writes.len()];
+    let mut worklist: Vec<usize> = Vec::new();
+
+    for (pass_id, write) in writes.enumerate() {
+        let is_root = pass_id < internal_count
+            || write
+                .as_ref()
+                .iter()
+                .any(|w| outputs.contains(&w.id) || temporal.contains(&w.id));
+        if is_root {
+            live[pass_id] = true;
+            worklist.push(pass_id);
+        }
+    }
+
+    while let Some(pass_id) = worklist.pop() {
+        for &producer in &raw_producers[pass_id] {
+            if !live[producer] {
+                live[producer] = true;
+                worklist.push(producer);
+            }
+        }
+    }
+    live
 }
 
 /// Is `[start, end)` entirely inside `covered`? `covered` is kept sorted and
@@ -567,6 +628,11 @@ pub struct RenderGraph {
     /// cross-frame barrier for the ping-pong write→read (mirrors what
     /// `Tlas::queue_build` does explicitly for the TLAS). Cleared on `reset`.
     registered_temporal: Vec<(usize, usize, u32)>,
+    /// Resources this frame declares as its results, via [`Self::mark_output`] or
+    /// a pass marked with `PassCommonDataBuilder::mark_output`. Dead-pass culling
+    /// keeps only what transitively feeds one of these (plus the temporal backings
+    /// and the internal prefix — see [`live_passes`]). Cleared on `reset`.
+    output_resources: HashSet<u32>,
     /// One primary command buffer per frame-in-flight slot, re-recorded when its
     /// slot comes around (reuse gated by [`Self::wait_for_slot_reuse`]).
     cmd_buffers: Vec<CmdBuffer>,
@@ -622,6 +688,7 @@ impl RenderGraph {
             transient_resources,
             resource_end_states: HashMap::new(),
             registered_temporal: Vec::new(),
+            output_resources: HashSet::new(),
             checkpoint_markers: HashMap::new(),
             cmd_buffers,
             retired_passes,
@@ -703,6 +770,7 @@ impl RenderGraph {
         self.prologue_copies.clear();
         self.resource_end_states.clear();
         self.registered_temporal.clear();
+        self.output_resources.clear();
         // Free the previous occupant of this slot (frame N - MAX_FRAMES_IN_FLIGHT):
         // its passes own the AS-build scratch the GPU read, and `wait_for_slot_reuse`
         // proved that frame's submission is complete. This slot's transient pool is
@@ -1112,14 +1180,15 @@ impl RenderGraph {
     }
 
     /// Build the nodes the graph synthesizes for itself and prepend them to
-    /// `self.passes`. Called once at the top of [`Self::compile`], before the
-    /// hazard scan.
+    /// `self.passes`, returning how many were prepended. Called once at the top of
+    /// [`Self::compile`], before the hazard scan. The returned count is the live
+    /// prefix dead-pass culling never touches — see [`live_passes`].
     ///
     /// Front placement is load-bearing: the hazard scan is a linear walk in
     /// insertion order that only ever adds edges from an already-seen pass, so
     /// an internal node placed at the back would be ordered *after* its
     /// consumers by WAR edges rather than before them.
-    fn build_internal_passes(&mut self) -> SrResult<()> {
+    fn build_internal_passes(&mut self) -> SrResult<usize> {
         let mut internal: Vec<AnyRenderPass> = Vec::new();
 
         // `__imports`: declare the access every imported resource carries into
@@ -1173,11 +1242,73 @@ impl RenderGraph {
             internal.push(AnyRenderPass::Transfer(builder.build()));
         }
 
-        if !internal.is_empty() {
+        let internal_count = internal.len();
+        if internal_count > 0 {
             internal.append(&mut self.passes);
             self.passes = internal;
         }
-        Ok(())
+        Ok(internal_count)
+    }
+
+    /// Drop every pass that cannot reach a declared result, in place.
+    ///
+    /// Runs between `build_internal_passes` and the analysis whose output actually
+    /// drives the frame, so the surviving passes stay densely indexed — every later
+    /// stage (`schedule_pos`, the barrier map, the alias lifetimes, the record
+    /// loop) keys off a pass's position in `self.passes`.
+    ///
+    /// Dropping is safe here: a culled pass was never recorded into a command
+    /// buffer, so nothing in flight refers to it or to the scratch it owns.
+    fn cull_dead_passes(&mut self, raw_producers: &[Vec<usize>], internal_count: usize) {
+        // A pass marked as an output contributes its whole write list, so both tag
+        // surfaces collapse into one set of output resources before rooting.
+        let mut outputs = self.output_resources.clone();
+        for pass in self.passes.iter().filter(|p| p.common().output) {
+            outputs.extend(pass.common().write.iter().map(|w| w.id));
+        }
+        let temporal: HashSet<u32> = self.registered_temporal.iter().map(|(_, _, rid)| *rid).collect();
+
+        // No declared result means nothing to cull against — an app that never calls
+        // `mark_output` keeps today's behaviour (everything runs) instead of
+        // compiling an empty frame.
+        if outputs.is_empty() && temporal.is_empty() {
+            log::error!("render graph: There exists no output nodes, dead pass culling skipped. If not the graph would have been empty.");
+            return;
+        }
+
+        for out in &outputs {
+            if !self.passes.iter().any(|p| p.common().write.iter().any(|w| w.id == *out)) {
+                log::warn!("render graph: resource {out} is marked as an output but no pass writes it");
+            }
+        }
+
+        let live = live_passes(
+            self.passes.iter().map(|p| p.common().write.as_slice()),
+            raw_producers,
+            &outputs,
+            &temporal,
+            internal_count,
+        );
+        let culled = live.iter().filter(|l| !**l).count();
+        if culled == 0 {
+            return;
+        }
+
+        log::info!(
+            "render graph: culled {culled}/{} passes (kept {}): {}",
+            live.len(),
+            live.len() - culled,
+            self.passes
+                .iter()
+                .zip(&live)
+                .filter(|(_, keep)| !**keep)
+                .map(|(p, _)| p.common().name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let mut keep = live.iter();
+        self.passes.retain(|_| *keep.next().expect("one flag per pass"));
     }
 
     pub fn compile(&mut self) -> SrResult<()> {
@@ -1190,21 +1321,34 @@ impl RenderGraph {
         // for example you could build a tlas the next frame if this is seen as an internal or created on the spot data structure, but exporting it would block the cpu on interacting with it until the previous frame has ended.
         // To further emphasise this there will need to be a dedicated way to handle multiple data based of frames in flight , transformation matrices and the camera should only live as long as a frame.
 
-        self.build_internal_passes()?;
+        let internal_count = self.build_internal_passes()?;
 
         //From now on the graph passes should not be touched
 
         let slot = self.current_slot();
+
+        let analyze = |passes: &[AnyRenderPass]| {
+            analyze_passes(passes.iter().map(|pass| {
+                let common = pass.common();
+                (common.read.as_slice(), common.write.as_slice())
+            }))
+        };
+        let mut analysis = analyze(&self.passes);
+        self.cull_dead_passes(&analysis.raw_producers, internal_count);
+        if self.passes.len() != analysis.raw_producers.len() {
+            // Lifetimes, components and the dep graph are all keyed by position in
+            // `self.passes`, so they have to be recomputed against the compacted list
+            // rather than patched up.
+            analysis = analyze(&self.passes);
+        }
         let pass_count = self.passes.len();
 
         let PassAnalysis {
             resource_usages,
             dep_graph,
             components,
-        } = analyze_passes(self.passes.iter().map(|pass| {
-            let common = pass.common();
-            (common.read.as_slice(), common.write.as_slice())
-        }));
+            raw_producers: _,
+        } = analysis;
 
         self.transient_resources[slot].populate(
             Arc::clone(&self.core),
@@ -1729,6 +1873,17 @@ impl RenderGraph {
     /// with the next `reset`. Temp impl, see [`ResourceEndState`].
     pub fn resource_end_states(&self) -> &HashMap<u32, ResourceEndState> {
         &self.resource_end_states
+    }
+
+    /// Declare `handle` a result of this frame: dead-pass culling keeps whatever
+    /// writes it, and everything that transitively feeds those writes. Anything
+    /// that reaches no marked output (and no temporal backing) is dropped by
+    /// [`Self::compile`] before the hazard scan — see [`live_passes`].
+    ///
+    /// Must be called before `compile`; `run_present`'s source is the canonical
+    /// one. Cleared by `reset`, so mark again on every rebuild.
+    pub fn mark_output<R: Resource>(&mut self, handle: &Handle<R>) {
+        self.output_resources.insert(handle.id);
     }
 
     /// End state of one resource by handle, if the graph compiled it.
@@ -2591,5 +2746,158 @@ mod tests {
             recorded_cb,
             "cmd_buffer was reallocated across run()"
         );
+    }
+
+    // ── Dead-pass culling ───────────────────────────────────────────────────
+    // Driven from raw (read, write) declarations, the same shape `bench_support`
+    // feeds `analyze_passes` — no device needed.
+
+    fn refs(ids: &[u32], write: bool) -> Vec<ResourceRef> {
+        let access_type = if write {
+            AccessType::ComputeShaderWrite
+        } else {
+            AccessType::ComputeShaderReadOther
+        };
+        ids.iter()
+            .map(|id| ResourceRef {
+                id: *id,
+                access: PassResourceAccessType {
+                    access_type,
+                    sync_type: PassResourceAccessSyncType::AlwaysSync,
+                },
+            })
+            .collect()
+    }
+
+    /// `(reads, writes)` per pass → the liveness mask, with no internal prefix and
+    /// no temporal resources unless the test says otherwise.
+    fn cull(decls: &[(Vec<ResourceRef>, Vec<ResourceRef>)], outputs: &[u32], temporal: &[u32], internal_count: usize) -> Vec<bool> {
+        let analysis = analyze_passes(decls.iter().map(|(r, w)| (r.as_slice(), w.as_slice())));
+        live_passes(
+            decls.iter().map(|(_, w)| w.as_slice()),
+            &analysis.raw_producers,
+            &outputs.iter().copied().collect(),
+            &temporal.iter().copied().collect(),
+            internal_count,
+        )
+    }
+
+    #[test]
+    fn cull_keeps_the_chain_feeding_an_output() {
+        // A: -> 0 | B: 0 -> 1 | C: 1 -> 2 (the output)
+        let decls = vec![
+            (vec![], refs(&[0], true)),
+            (refs(&[0], false), refs(&[1], true)),
+            (refs(&[1], false), refs(&[2], true)),
+        ];
+        assert_eq!(cull(&decls, &[2], &[], 0), vec![true, true, true]);
+    }
+
+    #[test]
+    fn cull_drops_a_pass_no_output_reaches() {
+        // A: -> 0 | B: 0 -> 1 (output) | D: 0 -> 9, read by nobody.
+        let decls = vec![
+            (vec![], refs(&[0], true)),
+            (refs(&[0], false), refs(&[1], true)),
+            (refs(&[0], false), refs(&[9], true)),
+        ];
+        assert_eq!(cull(&decls, &[1], &[], 0), vec![true, true, false]);
+        // Marking the dead pass's own output instead keeps it and drops B.
+        assert_eq!(cull(&decls, &[9], &[], 0), vec![true, false, true]);
+    }
+
+    #[test]
+    fn cull_does_not_follow_write_after_read_edges() {
+        // E reads r0 and is dead; F overwrites r0 afterwards and is the output.
+        // The dep graph has E -> F (WAR), which must not resurrect E.
+        let decls = vec![
+            (vec![], refs(&[0], true)),
+            (refs(&[0], false), refs(&[9], true)),
+            (vec![], refs(&[0], true)),
+        ];
+        assert_eq!(cull(&decls, &[0], &[], 0), vec![true, false, true]);
+    }
+
+    #[test]
+    fn cull_roots_temporal_writes_and_the_internal_prefix() {
+        // Pass 0 is the internal prefix; pass 1 writes only a temporal backing —
+        // nothing reads it this frame, but next frame will.
+        let decls = vec![
+            (vec![], refs(&[0], true)),
+            (refs(&[0], false), refs(&[7], true)),
+            (vec![], refs(&[9], true)),
+        ];
+        assert_eq!(cull(&decls, &[], &[7], 1), vec![true, true, false]);
+    }
+
+    /// End-to-end: a pass whose output nothing reads and nothing marks is never
+    /// recorded, and the transient image it alone wrote is never allocated.
+    #[test]
+    #[ignore = "needs an RT-capable GPU (Core::new); run with --include-ignored"]
+    fn compile_culls_a_pass_that_reaches_no_output() {
+        use crate::render_graph::pass_builder::{ComputeRenderPassBuilder, PassCommonDataBuilder};
+        use parking_lot::Mutex;
+
+        let core = Arc::new(Core::new(false, false, vk::Format::R8G8B8A8_UNORM).expect("Core::new failed"));
+        let mut rg = RenderGraph::new(Arc::clone(&core)).expect("RenderGraph::new failed");
+        core.advance_frame();
+        let slot = rg.current_slot();
+
+        let img_a = rg.create_resource(image(64, "img_a"));
+        let img_dead = rg.create_resource(image(64, "img_dead"));
+
+        let fired: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Live: writes the frame's declared result.
+        let mut live = PassCommonDataBuilder::new(&mut rg, "live");
+        live.write(&img_a, vk_sync::AccessType::ComputeShaderWrite).expect("live write");
+        {
+            let fired = Arc::clone(&fired);
+            live.render(move |_cb, _tr| {
+                fired.lock().push("live");
+                Ok(())
+            });
+        }
+        rg.add_render_pass(AnyRenderPass::Compute(
+            ComputeRenderPassBuilder::default()
+                .common(live.build())
+                .build()
+                .expect("build live pass"),
+        ));
+
+        // Dead: reads the live output, writes an image nobody ever reads.
+        let mut dead = PassCommonDataBuilder::new(&mut rg, "dead");
+        dead.read(&img_a, vk_sync::AccessType::ComputeShaderReadOther)
+            .expect("dead read");
+        dead.write(&img_dead, vk_sync::AccessType::ComputeShaderWrite)
+            .expect("dead write");
+        {
+            let fired = Arc::clone(&fired);
+            dead.render(move |_cb, _tr| {
+                fired.lock().push("dead");
+                Ok(())
+            });
+        }
+        rg.add_render_pass(AnyRenderPass::Compute(
+            ComputeRenderPassBuilder::default()
+                .common(dead.build())
+                .build()
+                .expect("build dead pass"),
+        ));
+
+        rg.mark_output(&img_a);
+        rg.compile().expect("compile failed");
+
+        assert_eq!(*fired.lock(), vec!["live"], "the dead pass was recorded");
+        assert!(
+            !rg.passes.iter().any(|p| p.common().name == "dead"),
+            "the dead pass survived the cull"
+        );
+        // No lifetime ⇒ no placement ⇒ no memory was ever allocated for it.
+        assert!(
+            !rg.transient_resources[slot].placements.contains_key(&img_dead.id),
+            "img_dead was allocated despite its only writer being culled"
+        );
+        assert!(rg.transient_resources[slot].placements.contains_key(&img_a.id));
     }
 }

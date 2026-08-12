@@ -16,6 +16,10 @@ pub(crate) struct PassCommonData {
     pub(crate) name: String,
     #[allow(dead_code)]
     id: u32,
+    /// This pass produces a frame result: dead-pass culling treats everything in
+    /// `write` as an output of the graph. See
+    /// [`PassCommonDataBuilder::mark_output`] and `RenderGraph::mark_output`.
+    pub(crate) output: bool,
     /// The user-supplied recording function for this pass. Invoked by
     /// `RenderGraph::compile` once per pass in topological order, after the
     /// barriers required by that pass's incoming edges have already been issued
@@ -57,9 +61,19 @@ impl PassCommonDataBuilder {
                 write: vec![],
                 name: name.into(),
                 id: rg.next_pass_id(),
+                output: false,
                 render: None,
             },
         }
+    }
+
+    /// Mark this pass as producing a frame result, so dead-pass culling keeps it
+    /// (and everything it transitively reads). Shorthand for calling
+    /// `RenderGraph::mark_output` on every resource this pass writes — declare the
+    /// writes first, since the fold happens over the final `write` list at compile.
+    pub fn mark_output(&mut self) -> &mut Self {
+        self.pass_common_data.output = true;
+        self
     }
 
     /// Attach the recording closure to this pass. Replaces any previous one.
