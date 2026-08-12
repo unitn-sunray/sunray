@@ -1655,10 +1655,28 @@ impl RenderGraph {
 
             for i in 1..epochs.len() {
                 let (prev, next) = (&epochs[i - 1], &epochs[i]);
-                // Both epochs inside one pass: a pass that reads then writes its own
-                // resource serializes that itself, exactly as the self-edge skip in
+                // Both epochs wholly inside one pass: a pass that reads then writes its
+                // own resource serializes that itself, exactly as the self-edge skip in
                 // `add_dep_edge` assumes.
-                if next.first_pass == prev.last_pass {
+                //
+                // `prev` must be *confined* to that pass, not merely end there. A read
+                // run spanning several passes and ending at `next.first_pass` still has
+                // earlier readers, and nothing serializes those against the write —
+                // `add_dep_edge` records the ordering edge for them (the self-edge it
+                // skips is only the pass against itself), but a schedule edge is not an
+                // execution dependency. Skipping on `last_pass` alone drops that WAR.
+                //
+                // The barrier this emits sits *before* the writing pass, so its source
+                // mask also names the accesses of that pass's own read. Harmless: masks
+                // name stages, not commands, and the pass's read is recorded after the
+                // barrier, so the pass still serializes itself.
+                //
+                //TODO a pass that reads and writes the same *image* at two different
+                // layouts is unrepresentable either way — the transition would have to
+                // land mid-pass, which the graph cannot express, and whichever layout the
+                // barrier picks the other access is wrong. Reject it in the pass builder
+                // rather than emitting something quietly incorrect.
+                if prev.first_pass == prev.last_pass && prev.last_pass == next.first_pass {
                     continue;
                 }
                 barriers_at.entry(next.first_pass).or_default().push(ResourceBarrier {
@@ -2256,6 +2274,59 @@ mod tests {
         assert_eq!(war.next, vec![AccessType::ComputeShaderWrite]);
 
         assert_eq!(ends[&0].last_use_pass, Some(5));
+    }
+
+    /// A pass that reads *and* writes a resource serializes itself, so the epoch
+    /// pair it straddles needs no barrier — but only its own read. When the read run
+    /// it closes started at an earlier pass, that earlier reader is still ordered
+    /// against the write by nothing but the schedule, which is not an execution
+    /// dependency. The skip must therefore key on the read run being confined to one
+    /// pass, not on it merely ending there.
+    #[test]
+    fn war_survives_a_read_run_ending_at_the_writing_pass() {
+        let resources = vec![GraphResourceInfo::Created(GraphResourceDesc::Buffer(buffer(1024, "buf")))];
+        let mut u = BTreeMap::new();
+        // Pass 3 reads and writes; pass 2 read the same run.
+        u.insert(
+            0,
+            usages(&[
+                (1, AccessType::ComputeShaderWrite),
+                (2, AccessType::ComputeShaderReadOther),
+                (3, AccessType::ComputeShaderReadOther),
+                (3, AccessType::ComputeShaderWrite),
+            ]),
+        );
+
+        let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(4), &HashMap::new());
+
+        let war = barriers
+            .get(&3)
+            .and_then(|b| b.iter().find(|b| b.next == vec![AccessType::ComputeShaderWrite]))
+            .expect("pass 2's read must be ordered against pass 3's write");
+        assert_eq!(war.prev, vec![AccessType::ComputeShaderReadOther]);
+    }
+
+    /// The other half of the same rule: when the epoch being left *is* confined to
+    /// the writing pass, the pass serializes it and no barrier is emitted. Without
+    /// this the fix above would put a barrier between a pass and itself.
+    #[test]
+    fn self_contained_read_then_write_stays_barrier_free() {
+        let resources = vec![GraphResourceInfo::Created(GraphResourceDesc::Buffer(buffer(1024, "buf")))];
+        let mut u = BTreeMap::new();
+        u.insert(
+            0,
+            usages(&[
+                (1, AccessType::ComputeShaderWrite),
+                (3, AccessType::ComputeShaderReadOther),
+                (3, AccessType::ComputeShaderWrite),
+            ]),
+        );
+
+        let (barriers, _) = RenderGraph::plan_barriers(&resources, &u, &identity_schedule(4), &HashMap::new());
+
+        let total: usize = barriers.values().map(|v| v.len()).sum();
+        assert_eq!(total, 1, "only the RAW into pass 3's read belongs here, got {barriers:#?}");
+        assert_eq!(barriers[&3][0].next, vec![AccessType::ComputeShaderReadOther]);
     }
 
     /// A read run only merges while the reads agree on image layout. Sampled and
