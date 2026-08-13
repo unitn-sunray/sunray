@@ -1314,14 +1314,9 @@ impl RenderGraph {
     }
 
     pub fn compile(&mut self) -> SrResult<()> {
-        //TODO force injection of previous temporal data on rebuild, the graph is incapable of understanding temporal dep across compilations
-        //TODO mark the render pass goals as the result of the graph so anything unnecessary can be removed
         //TODO there are some complex optimizations as shown here https://www.youtube.com/watch?v=v9LaTFLhP38 and this is the site where it will be published the paper https://dl.acm.org/profile/99661091135
         //TODO respect PassResourceAccessSyncType (NeverSync / SkipSyncIfSameAccessType) when deciding whether to emit a barrier
         //TODO it currently returns a one time submit, but the cmd buffer can be reuse as long as the graph doesn't get rebuilt this requires the temporal stuff though and some rework on the sync side between each frame
-        //TODO the render graph currently has no way to export the data, this is useful to synchronize across frames. The data should be released and reused basically each frame. This put a constraint, mutable data imported into the graph is hard to work with,
-        // for example you could build a tlas the next frame if this is seen as an internal or created on the spot data structure, but exporting it would block the cpu on interacting with it until the previous frame has ended.
-        // To further emphasise this there will need to be a dedicated way to handle multiple data based of frames in flight , transformation matrices and the camera should only live as long as a frame.
 
         let internal_count = self.build_internal_passes()?;
 

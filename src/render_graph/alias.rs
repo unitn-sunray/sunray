@@ -15,10 +15,11 @@
 //!   bucket sits at offset 0 and the bucket is `max(member sizes)`, so two members
 //!   never co-occupy. Simple and fast, but a 4 MiB scratch buffer folded into a
 //!   bucket opened by a 64 MiB G-buffer strands the other 60 MiB.
-//! * [`AliasStrategy::Bucket`] — the PathFinder algorithm ("GPU Memory Aliasing").
-//!   Buckets are sized by their largest member and smaller resources are packed
-//!   *at offsets* into the byte regions left free by lifetime-disjoint occupants.
-//!   Recovers that waste; costs O(N² log N) instead of O(N·buckets).
+//! * [`AliasStrategy::Bucket`] — the default. The PathFinder algorithm ("GPU
+//!   Memory Aliasing"). Buckets are sized by their largest member and smaller
+//!   resources are packed *at offsets* into the byte regions left free by
+//!   lifetime-disjoint occupants. Recovers that waste; costs O(N² log N) instead
+//!   of O(N·buckets), which at frame sizes is a few microseconds on a rebuild.
 //!
 //! Both emit the same [`Placement`] shape, so everything downstream — binding,
 //! and the aliasing barriers in `RenderGraph::alias_predecessors` — is shared.
@@ -72,9 +73,9 @@ pub struct BucketReqs {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AliasStrategy {
     /// One resource per bucket at a time; bucket size is the largest member.
-    #[default]
     Slot,
     /// Offset packing: lifetime-disjoint resources share a bucket's byte range.
+    #[default]
     Bucket,
     /// No aliasing: one bucket per resource. Wastes memory on purpose — it is the
     /// bisect knob for "is this corruption the aliasing?". No two resources share a
@@ -84,21 +85,21 @@ pub enum AliasStrategy {
 }
 
 impl AliasStrategy {
-    /// Parse `SUNRAY_ALIAS_STRATEGY`. Unset or unrecognized → [`Self::Slot`].
+    /// Parse `SUNRAY_ALIAS_STRATEGY`. Unset or unrecognized → [`Self::Bucket`].
     pub fn from_env() -> Self {
         let Ok(raw) = std::env::var(crate::utils::ALIAS_STRATEGY) else {
-            return Self::Slot;
+            return Self::Bucket;
         };
         match raw.trim().to_ascii_lowercase().as_str() {
-            "" | "slot" => Self::Slot,
-            "bucket" => Self::Bucket,
+            "" | "bucket" => Self::Bucket,
+            "slot" => Self::Slot,
             "off" | "none" => Self::Off,
             other => {
                 log::warn!(
-                    "{}: unrecognized value {other:?} (expected `slot`, `bucket` or `off`) — using `slot`",
+                    "{}: unrecognized value {other:?} (expected `slot`, `bucket` or `off`) — using `bucket`",
                     crate::utils::ALIAS_STRATEGY
                 );
-                Self::Slot
+                Self::Bucket
             }
         }
     }
