@@ -33,7 +33,7 @@ struct GpuVertex {
 /// Push constant — matches `egui.slang`'s `EguiPC` (float2 + 2 heap slots).
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct EguiPushConstant {
+pub(crate) struct EguiPushConstant {
     screen_size_points: [f32; 2],
     tex: u32,
     samp: u32,

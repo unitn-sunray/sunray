@@ -18,6 +18,7 @@ impl IndexBuffer {
         T: 'static + Copy,
     {
         let usage_flags = vk::BufferUsageFlags::INDEX_BUFFER
+            | vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
 
@@ -44,6 +45,7 @@ impl IndexBuffer {
     {
         let usage_flags = vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::INDEX_BUFFER
+            | vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
 

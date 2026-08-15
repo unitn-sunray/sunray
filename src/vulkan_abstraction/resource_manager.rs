@@ -465,9 +465,13 @@ impl<K: Hash + Eq + Copy + Send + 'static> ResourceManager<K> {
         material: Material,
         emissive_triangles: &[vulkan_abstraction::gltf::EmissiveTriangle],
     ) -> SrResult<()> {
+        // Heap slots, not device addresses — see `EntityGpuData`. Both are
+        // allocated lazily on first call and cached on the buffer, so they are
+        // stable for the BLAS's lifetime and cost one descriptor write each.
         let gpu_data = EntityGpuData {
-            vertex_buffer: blas.vertex_buffer().get_device_address(),
-            index_buffer: blas.index_buffer().get_device_address(),
+            vertex_buffer: blas.vertex_buffer().storage_slot(),
+            index_buffer: blas.index_buffer().storage_slot(),
+            _pad: [0; 2],
             material,
         };
         let (slot, copy_region) = self.meshes_info.allocate_and_update(&gpu_data)?;

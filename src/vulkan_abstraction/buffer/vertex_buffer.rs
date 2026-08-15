@@ -15,6 +15,7 @@ impl VertexBuffer {
     pub fn new_for_blas_from_data<T: Copy>(core: Arc<vulkan_abstraction::Core>, data: &[T]) -> SrResult<Self> {
         let usage_flags = vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::VERTEX_BUFFER
+            | vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
 
@@ -29,6 +30,7 @@ impl VertexBuffer {
     pub fn new_for_blas<T>(core: Arc<vulkan_abstraction::Core>, len: vk::DeviceSize) -> SrResult<Self> {
         let usage_flags = vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::VERTEX_BUFFER
+            | vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
 

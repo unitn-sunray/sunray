@@ -16,7 +16,7 @@ void any_hit(inout RayPayload payload, BuiltInTriangleIntersectionAttributes att
 
     // OPAQUE — closest-hit handles it.
     // Material fields are inlined into MeshInfo to work around the Slang
-    // heap-mode nested-struct offset bug (see rt_types.slang::MeshInfo).
+    // heap-mode nested-struct access-chain bug (see rt_types.slang::MeshInfo).
     if (mesh_info.material_alpha_mode == 0) {
         return;
     }
@@ -26,13 +26,15 @@ void any_hit(inout RayPayload payload, BuiltInTriangleIntersectionAttributes att
                          attribs.barycentrics.y);
 
     uint index_offset = PrimitiveIndex() * 3;
-    uint i0 = mesh_info.indices[index_offset + 0];
-    uint i1 = mesh_info.indices[index_offset + 1];
-    uint i2 = mesh_info.indices[index_offset + 2];
+    StructuredBuffer<uint> index_buf = mesh_info.get_indices();
+    uint i0 = index_buf[index_offset + 0];
+    uint i1 = index_buf[index_offset + 1];
+    uint i2 = index_buf[index_offset + 2];
 
-    float2 uv0 = mesh_info.vertices[i0].base_color_tex_coord;
-    float2 uv1 = mesh_info.vertices[i1].base_color_tex_coord;
-    float2 uv2 = mesh_info.vertices[i2].base_color_tex_coord;
+    StructuredBuffer<VertexAttributes> vertex_buf = mesh_info.get_vertices();
+    float2 uv0 = vertex_buf[i0].base_color_tex_coord;
+    float2 uv1 = vertex_buf[i1].base_color_tex_coord;
+    float2 uv2 = vertex_buf[i2].base_color_tex_coord;
     float2 uv = uv0 * bary.x + uv1 * bary.y + uv2 * bary.z;
 
     float4 base_color = sample_texture(mesh_info.material_base_color_image, mesh_info.material_base_color_sampler, uv, mesh_info.material_base_color_value);

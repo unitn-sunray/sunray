@@ -20,13 +20,15 @@ void closest_hit(inout RayPayload payload, BuiltInTriangleIntersectionAttributes
 
     uint index_offset = PrimitiveIndex() * 3;
     uint indices[3];
-    indices[0] = mesh_info.indices[index_offset + 0];
-    indices[1] = mesh_info.indices[index_offset + 1];
-    indices[2] = mesh_info.indices[index_offset + 2];
+    StructuredBuffer<uint> index_buf = mesh_info.get_indices();
+    indices[0] = index_buf[index_offset + 0];
+    indices[1] = index_buf[index_offset + 1];
+    indices[2] = index_buf[index_offset + 2];
 
-    VertexAttributes v0 = mesh_info.vertices[indices[0]];
-    VertexAttributes v1 = mesh_info.vertices[indices[1]];
-    VertexAttributes v2 = mesh_info.vertices[indices[2]];
+    StructuredBuffer<VertexAttributes> vertex_buf = mesh_info.get_vertices();
+    VertexAttributes v0 = vertex_buf[indices[0]];
+    VertexAttributes v1 = vertex_buf[indices[1]];
+    VertexAttributes v2 = vertex_buf[indices[2]];
 
     float3 normal      = v0.normal * bary.x + v1.normal * bary.y + v2.normal * bary.z;
     float3 tangent_dir = v0.tangent.xyz * bary.x + v1.tangent.xyz * bary.y + v2.tangent.xyz * bary.z;
@@ -37,7 +39,7 @@ void closest_hit(inout RayPayload payload, BuiltInTriangleIntersectionAttributes
     float2 normal_uv = v0.normal_tex_coord * bary.x     + v1.normal_tex_coord * bary.y     + v2.normal_tex_coord * bary.z;
 
     // Material fields are inlined into MeshInfo (Slang heap-mode nested-struct
-    // offset bug — see rt_types.slang::MeshInfo) and texture references are
+    // access-chain bug — see rt_types.slang::MeshInfo) and texture references are
     // pre-resolved heap slots.
     float4 base_color = sample_texture(mesh_info.material_base_color_image, mesh_info.material_base_color_sampler, uv, mesh_info.material_base_color_value);
     float3 emissive_factor_rgb = mesh_info.material_emissive_factor.rgb;

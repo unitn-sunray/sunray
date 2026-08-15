@@ -30,7 +30,7 @@
 
 mod asset;
 mod camera;
-mod egui_paint;
+pub(crate) mod egui_paint;
 mod egui_support;
 mod gltf_scene;
 mod instance;

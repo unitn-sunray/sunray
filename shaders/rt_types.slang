@@ -39,10 +39,11 @@ public struct RayPayload {
 
 // --- Vertex / mesh ----------------------------------------------------------
 // Explicit padding fields mirror the `#[repr(C, packed)]` Rust `Vertex` in
-// `src/vulkan_abstraction/gltf/vertex.rs`. Slang's `T*` (used for BDA mesh
-// access) lays the struct out in scalar layout — without the explicit pad
-// fields, `normal` would land at offset 12 instead of 16, breaking every
-// closest-hit / any-hit read. 96 bytes total.
+// `src/vulkan_abstraction/gltf/vertex.rs`. They are what makes the layout agree
+// with the CPU: without them `normal` would land at offset 12 instead of 16.
+// Offsets are 0,12,16,28,32,48,56,64,72,80,88 with a 96-byte stride, and are
+// identical under std430 (the heap `StructuredBuffer` path used today) and
+// Slang's scalar layout (the old `VertexAttributes*` BDA path).
 public struct VertexAttributes {
     public float3 position;
     public float _pad0;
@@ -57,32 +58,44 @@ public struct VertexAttributes {
     public float2 _pad3;
 }
 
-// BLAS vertex/index buffers are reached via buffer-device-address pointers
-// (one address per BLAS), not heap descriptors — the heap would otherwise
-// need a slot per BLAS buffer. Slang's `T*` lowers to a SPIR-V
-// `PhysicalStorageBuffer` pointer and supports subscript via the stdlib's
-// `Ptr<T>::__subscript`, which is the equivalent of GLSL's
-// `buffer_reference { T v[]; }` unbounded-array idiom.
+// One entry per BLAS, indexed by `InstanceID()`. Read through a heap
+// `StructuredBuffer<MeshInfo>` → std430 layout; mirrors `EntityGpuData` in
+// `src/vulkan_abstraction/resources/entity.rs`. 128 B stride.
 //
-// **Material fields are inlined** rather than nested as a `Material` struct:
-// Slang's heap-mode (`OpBufferPointerEXT`) access chain for a nested struct
-// member drops the parent member offset, so every nested-material read would
-// land 16 bytes off. Field order/sizes mirror `#[repr(C, packed)]` `Material`
-// in `src/vulkan_abstraction/resources/material.rs` exactly (112 bytes after
-// the two pointers).
-// TODO issue the problem to the slang repo and look at alternatives and alignment
+// **Material fields are inlined** rather than nested as a `Material` struct.
+// Nesting produces *correct-looking* SPIR-V that renders wrong: the
+// `OpMemberDecorate` offsets are right (`material` at 16, every sub-member at its
+// CPU offset) and the access chain looks well-formed
+// (`OpAccessChain %MeshInfo* %uint_3` then `%uint_N`), but the parent member
+// offset is not actually applied, so every material read lands 16 bytes low and
+// picks up the geometry slots as float data. Re-verified 2026-08-15 on Slang
+// 2026.13.1 — still broken.
 //
-// MeshInfo is read through a `StructuredBuffer` → std430 layout: every float4
-// must sit at a 16-aligned offset (hence the `_material_pad_mid_*` pair) and
-// the struct size must be a 16-multiple (hence the trailing pads) so the
-// std430 array stride (128) matches the CPU side.
+// Do NOT re-test this by diffing `OpMemberDecorate` offsets; they look correct
+// either way. The only test that catches it is rendering the scene: materials go
+// greyscale and the emissive panel goes dark.
+// TODO issue this to the slang repo with the above repro.
 //
-// `material_*_image` / `material_*_sampler` are *resolved descriptor heap
-// slots* (filled in at scene-load time on the CPU) — there is no texture
-// indirection buffer. `NULL_TEXTURE` in an image slot means "no texture".
+// Field order/sizes mirror `#[repr(C, packed)]` `Material` in
+// `src/vulkan_abstraction/resources/material.rs` exactly (112 bytes after the
+// 16-byte geometry header). std430 needs each `float4` on a 16-aligned offset
+// (hence `_material_pad_mid_*`) and the struct size a 16-multiple (hence the
+// trailing pads) so the array stride stays 128.
+//
+// `material_*_image` / `material_*_sampler` are *resolved descriptor heap slots*
+// (filled in at scene-load time on the CPU) — there is no texture indirection
+// buffer. `NULL_TEXTURE` in an image slot means "no texture".
+//
+// Geometry is reached through the heap rather than by buffer-device-address: the
+// BDA form (`VertexAttributes*` / `uint*`) made Slang tag every vertex and index
+// load `Aligned 4`, which stops the driver widening a `float3`/`float4` fetch into
+// one 128-bit load — a ~2.4x load-count penalty in the two hottest shaders in the
+// pipeline. Costs two buffer-section heap slots per BLAS, allocated once at scene
+// load.
 public struct MeshInfo {
-    public VertexAttributes* vertices;                          // 0
-    public uint* indices;                                       // 8
+    public uint vertices;                                       // 0   heap slot
+    public uint indices;                                        // 4   heap slot
+    public uint2 _pad;                                          // 8   float4 needs 16-alignment
     public float4 material_base_color_value;                    // 16
     public float material_metallic_factor;                      // 32
     public float material_roughness_factor;                     // 36
@@ -105,6 +118,15 @@ public struct MeshInfo {
     public uint material_emissive_sampler;                      // 116
     public uint _material_pad_end_0;                            // 120
     public uint _material_pad_end_1;                            // 124
+
+    public StructuredBuffer<VertexAttributes> get_vertices() {
+        DescriptorHandle<StructuredBuffer<VertexAttributes>> h = { vertices };
+        return h;
+    }
+    public StructuredBuffer<uint> get_indices() {
+        DescriptorHandle<StructuredBuffer<uint>> h = { indices };
+        return h;
+    }
 }
 
 // --- Emissive lighting ------------------------------------------------------
