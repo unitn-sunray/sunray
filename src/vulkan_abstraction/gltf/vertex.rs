@@ -52,7 +52,10 @@ const _: () = assert!(
     size_of::<Vertex>() == 64,
     "Vertex must stay in lockstep with VertexAttributes in shaders/rt_types.slang"
 );
-const _: () = assert!(std::mem::offset_of!(Vertex, position) == 0, "BLAS build requires position first");
+const _: () = assert!(
+    std::mem::offset_of!(Vertex, position) == 0,
+    "BLAS build requires position first"
+);
 const _: () = assert!(std::mem::offset_of!(Vertex, normal) == 16);
 const _: () = assert!(std::mem::offset_of!(Vertex, tangent) == 32);
 const _: () = assert!(std::mem::offset_of!(Vertex, uv0) == 48);
