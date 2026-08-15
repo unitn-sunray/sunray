@@ -11,6 +11,16 @@ import rt_types;
 // and passes it (or its fields) into these helpers explicitly. Slang doesn't
 // share globals across modules, so we keep the helpers pure.
 
+// --- UV set selection --------------------------------------------------------
+// Each texture slot picks one of the vertex's two UV sets via its bit in
+// `MeshInfo.material_uv_set_mask` (see `rt_types.slang::UV_SET_*`). Barycentric
+// interpolation happens on both sets first — they are already loaded as part of
+// the vertex fetch, so selecting afterwards costs one `select`, whereas branching
+// first would serialise the two paths across the wave.
+public float2 select_uv(uint uv_set_mask, uint slot_bit, float2 uv0, float2 uv1) {
+    return ((uv_set_mask >> slot_bit) & 1u) != 0u ? uv1 : uv0;
+}
+
 // --- RNG (PCG, one seed per thread) -----------------------------------------
 public struct Rng {
     public uint seed;
@@ -111,20 +121,6 @@ public float4 sample_texture(
     Texture2D<float4> tex = DescriptorHandle<Texture2D<float4>>(uint2(image_slot, 0));
     SamplerState smp = DescriptorHandle<SamplerState>(uint2(sampler_slot, 0));
     return tex.SampleLevel(smp, uv, 0.0);
-}
-
-// --- Vertex attribute interpolation -----------------------------------------
-public VertexAttributes interpolate_vertex_attributes(VertexAttributes v[3], float3 b) {
-    VertexAttributes r;
-    r.position                    = v[0].position * b.x                    + v[1].position * b.y                    + v[2].position * b.z;
-    r.normal                      = v[0].normal * b.x                      + v[1].normal * b.y                      + v[2].normal * b.z;
-    r.tangent                     = v[0].tangent * b.x                     + v[1].tangent * b.y                     + v[2].tangent * b.z;
-    r.base_color_tex_coord        = v[0].base_color_tex_coord * b.x        + v[1].base_color_tex_coord * b.y        + v[2].base_color_tex_coord * b.z;
-    r.metallic_roughness_tex_coord= v[0].metallic_roughness_tex_coord * b.x+ v[1].metallic_roughness_tex_coord * b.y+ v[2].metallic_roughness_tex_coord * b.z;
-    r.normal_tex_coord            = v[0].normal_tex_coord * b.x            + v[1].normal_tex_coord * b.y            + v[2].normal_tex_coord * b.z;
-    r.occlusion_tex_coord         = v[0].occlusion_tex_coord * b.x         + v[1].occlusion_tex_coord * b.y         + v[2].occlusion_tex_coord * b.z;
-    r.emissive_tex_coord          = v[0].emissive_tex_coord * b.x          + v[1].emissive_tex_coord * b.y          + v[2].emissive_tex_coord * b.z;
-    return r;
 }
 
 // --- BRDF helpers ----------------------------------------------------------

@@ -35,16 +35,22 @@ void closest_hit(inout RayPayload payload, BuiltInTriangleIntersectionAttributes
     // Handedness from first vertex only — interpolating .w produces seam corruption.
     float handedness = v0.tangent.w >= 0.0 ? 1.0 : -1.0;
 
-    float2 uv        = v0.base_color_tex_coord * bary.x + v1.base_color_tex_coord * bary.y + v2.base_color_tex_coord * bary.z;
-    float2 normal_uv = v0.normal_tex_coord * bary.x     + v1.normal_tex_coord * bary.y     + v2.normal_tex_coord * bary.z;
+    // Interpolate both UV sets; each texture then picks one via the material mask.
+    float2 uv0 = v0.uv0 * bary.x + v1.uv0 * bary.y + v2.uv0 * bary.z;
+    float2 uv1 = v0.uv1 * bary.x + v1.uv1 * bary.y + v2.uv1 * bary.z;
+    uint uv_mask = mesh_info.material_uv_set_mask;
+
+    float2 base_color_uv = select_uv(uv_mask, UV_SET_BASE_COLOR, uv0, uv1);
+    float2 normal_uv     = select_uv(uv_mask, UV_SET_NORMAL, uv0, uv1);
 
     // Material fields are inlined into MeshInfo (Slang heap-mode nested-struct
     // access-chain bug — see rt_types.slang::MeshInfo) and texture references are
     // pre-resolved heap slots.
-    float4 base_color = sample_texture(mesh_info.material_base_color_image, mesh_info.material_base_color_sampler, uv, mesh_info.material_base_color_value);
+    float4 base_color = sample_texture(mesh_info.material_base_color_image, mesh_info.material_base_color_sampler, base_color_uv, mesh_info.material_base_color_value);
     float3 emissive_factor_rgb = mesh_info.material_emissive_factor.rgb;
     float emissive_strength = mesh_info.material_emissive_factor.w;
-    float4 emissive_sample = sample_texture(mesh_info.material_emissive_image, mesh_info.material_emissive_sampler, uv, float4(emissive_factor_rgb, 1.0));
+    float2 emissive_uv = select_uv(uv_mask, UV_SET_EMISSIVE, uv0, uv1);
+    float4 emissive_sample = sample_texture(mesh_info.material_emissive_image, mesh_info.material_emissive_sampler, emissive_uv, float4(emissive_factor_rgb, 1.0));
     float3 final_emission = emissive_sample.rgb * emissive_strength;
 
     // Transform the geometric normal with the inverse-transpose (== Normal * WorldToObject for an affine matrix).
@@ -82,7 +88,8 @@ void closest_hit(inout RayPayload payload, BuiltInTriangleIntersectionAttributes
     float final_metallic = mesh_info.material_metallic_factor;
 
     if (mesh_info.material_metallic_roughness_image != NULL_TEXTURE) {
-        float4 mr_sample = sample_texture(mesh_info.material_metallic_roughness_image, mesh_info.material_metallic_roughness_sampler, uv, float4(1.0));
+        float2 mr_uv = select_uv(uv_mask, UV_SET_METALLIC_ROUGHNESS, uv0, uv1);
+        float4 mr_sample = sample_texture(mesh_info.material_metallic_roughness_image, mesh_info.material_metallic_roughness_sampler, mr_uv, float4(1.0));
         // glTF spec: G = roughness, B = metallic.
         final_roughness *= mr_sample.g;
         final_metallic  *= mr_sample.b;

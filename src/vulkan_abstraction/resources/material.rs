@@ -19,7 +19,11 @@ pub struct Material {
 
     metallic_factor: f32,
     roughness_factor: f32,
-    _pad_mid: [f32; 2],
+    /// Which vertex UV set each texture samples, one bit per slot (0 = `uv0`,
+    /// 1 = `uv1`); see [`Material::UV_SET_*`]. Occupies what used to be pure
+    /// padding, so encoding it costs nothing.
+    uv_set_mask: u32,
+    _pad_mid_1: f32,
 
     //rgb + strength
     emissive_factor: [f32; 4],
@@ -46,6 +50,20 @@ pub struct Material {
 
 impl Material {
     pub(crate) const NULL_TEXTURE_INDEX: u32 = u32::MAX;
+
+    // Bit positions in `uv_set_mask`. Must match `UV_SET_*` in
+    // `shaders/rt_types.slang`.
+    const UV_SET_BASE_COLOR: u32 = 0;
+    const UV_SET_METALLIC_ROUGHNESS: u32 = 1;
+    const UV_SET_NORMAL: u32 = 2;
+    const UV_SET_OCCLUSION: u32 = 3;
+    const UV_SET_EMISSIVE: u32 = 4;
+
+    /// Fold a per-texture `TEXCOORD_n` index (already clamped to 0/1 at load) into
+    /// its bit of the mask.
+    fn uv_bit(set: u32, bit: u32) -> u32 {
+        (set & 1) << bit
+    }
 
     /// Build the GPU material from the glTF one. `resolve` maps a glTF texture
     /// index (`Option<usize>`) to its `(image heap slot, sampler heap slot)`
@@ -80,7 +98,12 @@ impl Material {
             alpha_cutoff: material.alpha_cutoff,
             transmission_factor: material.transmission_factor,
             ior: material.ior,
-            _pad_mid: [0.0; 2],
+            uv_set_mask: Self::uv_bit(pbr.base_color_tex_coord_set, Self::UV_SET_BASE_COLOR)
+                | Self::uv_bit(pbr.metallic_roughness_tex_coord_set, Self::UV_SET_METALLIC_ROUGHNESS)
+                | Self::uv_bit(material.normal_tex_coord_set, Self::UV_SET_NORMAL)
+                | Self::uv_bit(material.occlusion_tex_coord_set, Self::UV_SET_OCCLUSION)
+                | Self::uv_bit(material.emissive_tex_coord_set, Self::UV_SET_EMISSIVE),
+            _pad_mid_1: 0.0,
             _pad_end: [0; 2],
 
             base_color_image,

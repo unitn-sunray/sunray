@@ -79,12 +79,17 @@ impl SunrayMaterial {
                 roughness_factor: self.roughness,
                 base_color_texture_index: None,
                 metallic_roughness_texture_index: None,
+                base_color_tex_coord_set: 0,
+                metallic_roughness_tex_coord_set: 0,
             },
             normal_texture_index: None,
             occlusion_texture_index: None,
             emissive_factor: self.emissive,
             emissive_strength: self.emissive_strength,
             emissive_texture_index: None,
+            normal_tex_coord_set: 0,
+            occlusion_tex_coord_set: 0,
+            emissive_tex_coord_set: 0,
             alpha_mode: gltf::material::AlphaMode::Opaque,
             alpha_cutoff: 0.5,
             double_sided: false,
@@ -255,18 +260,14 @@ fn convert_mesh(mesh: &Mesh) -> Result<(Vec<sr_gltf::Vertex>, Vec<u32>), String>
 
     let vertices: Vec<sr_gltf::Vertex> = (0..positions.len())
         .map(|i| {
-            // Runtime meshes have a single UV set: use it for every texture
-            // coordinate channel (only read if the material ever gets textures).
+            // Runtime meshes have a single UV set; `uv1` stays zero and no
+            // material selects it (every `*_tex_coord_set` below is 0).
             let uv = uvs.and_then(|uvs| uvs.get(i)).copied().unwrap_or([0.0, 0.0]);
             sr_gltf::Vertex {
                 position: positions[i],
                 normal: normals.and_then(|normals| normals.get(i)).copied().unwrap_or([0.0, 0.0, 1.0]),
                 tangent: tangents.and_then(|tangents| tangents.get(i)).copied().unwrap_or([0.0; 4]),
-                base_color_tex_coord: uv,
-                metallic_roughness_tex_coord: uv,
-                normal_tex_coord: uv,
-                occlusion_tex: uv,
-                emissive_tex: uv,
+                uv0: uv,
                 ..Default::default()
             }
         })

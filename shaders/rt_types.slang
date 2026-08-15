@@ -41,22 +41,31 @@ public struct RayPayload {
 // Explicit padding fields mirror the `#[repr(C, packed)]` Rust `Vertex` in
 // `src/vulkan_abstraction/gltf/vertex.rs`. They are what makes the layout agree
 // with the CPU: without them `normal` would land at offset 12 instead of 16.
-// Offsets are 0,12,16,28,32,48,56,64,72,80,88 with a 96-byte stride, and are
-// identical under std430 (the heap `StructuredBuffer` path used today) and
-// Slang's scalar layout (the old `VertexAttributes*` BDA path).
+// Offsets are 0,12,16,28,32,48,56 with a 64-byte stride.
+//
+// `position` is here because the BLAS build reads it at offset 0 — no shader
+// touches it (the hit point comes from `ray_origin + ray_dir * t`).
+//
+// Only two UV sets: which one each texture samples is a *material* property
+// (`material_uv_set_mask`), not a vertex one. See the Rust `Vertex` for why.
 public struct VertexAttributes {
     public float3 position;
     public float _pad0;
     public float3 normal;
     public float _pad1;
     public float4 tangent;
-    public float2 base_color_tex_coord;
-    public float2 metallic_roughness_tex_coord;
-    public float2 normal_tex_coord;
-    public float2 occlusion_tex_coord;
-    public float2 emissive_tex_coord;
-    public float2 _pad3;
+    public float2 uv0;
+    public float2 uv1;
 }
+
+// Bit positions in `MeshInfo.material_uv_set_mask`: 0 selects `uv0`, 1 selects
+// `uv1`. Must match `Material::UV_SET_*` in
+// `src/vulkan_abstraction/resources/material.rs`.
+public static const uint UV_SET_BASE_COLOR = 0;
+public static const uint UV_SET_METALLIC_ROUGHNESS = 1;
+public static const uint UV_SET_NORMAL = 2;
+public static const uint UV_SET_OCCLUSION = 3;
+public static const uint UV_SET_EMISSIVE = 4;
 
 // One entry per BLAS, indexed by `InstanceID()`. Read through a heap
 // `StructuredBuffer<MeshInfo>` → std430 layout; mirrors `EntityGpuData` in
@@ -99,7 +108,7 @@ public struct MeshInfo {
     public float4 material_base_color_value;                    // 16
     public float material_metallic_factor;                      // 32
     public float material_roughness_factor;                     // 36
-    public float _material_pad_mid_0;                           // 40
+    public uint material_uv_set_mask;                           // 40
     public float _material_pad_mid_1;                           // 44
     public float4 material_emissive_factor;                     // 48
     public uint material_alpha_mode;                            // 64

@@ -31,11 +31,15 @@ void any_hit(inout RayPayload payload, BuiltInTriangleIntersectionAttributes att
     uint i1 = index_buf[index_offset + 1];
     uint i2 = index_buf[index_offset + 2];
 
+    // Alpha comes from the base-colour texture, so only that slot's UV set matters.
     StructuredBuffer<VertexAttributes> vertex_buf = mesh_info.get_vertices();
-    float2 uv0 = vertex_buf[i0].base_color_tex_coord;
-    float2 uv1 = vertex_buf[i1].base_color_tex_coord;
-    float2 uv2 = vertex_buf[i2].base_color_tex_coord;
-    float2 uv = uv0 * bary.x + uv1 * bary.y + uv2 * bary.z;
+    VertexAttributes a0 = vertex_buf[i0];
+    VertexAttributes a1 = vertex_buf[i1];
+    VertexAttributes a2 = vertex_buf[i2];
+    uint uv_mask = mesh_info.material_uv_set_mask;
+    float2 uv = select_uv(uv_mask, UV_SET_BASE_COLOR, a0.uv0, a0.uv1) * bary.x
+              + select_uv(uv_mask, UV_SET_BASE_COLOR, a1.uv0, a1.uv1) * bary.y
+              + select_uv(uv_mask, UV_SET_BASE_COLOR, a2.uv0, a2.uv1) * bary.z;
 
     float4 base_color = sample_texture(mesh_info.material_base_color_image, mesh_info.material_base_color_sampler, uv, mesh_info.material_base_color_value);
 

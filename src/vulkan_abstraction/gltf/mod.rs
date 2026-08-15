@@ -34,15 +34,37 @@ macro_rules! get_texture_indices {
     };
 }
 
+/// Copy `TEXCOORD_<set>` into `vertices[..].<field>`, leaving the field at its
+/// default when the primitive doesn't carry that set.
+///
+/// Previously this was `read_tex_coords(n).unwrap()` run once per *texture slot*
+/// using that texture's `tex_coord` index. Two problems: a primitive with no
+/// `TEXCOORD_0` panicked (a material with no textures still asks for set 0), and
+/// the vertex data ended up material-dependent even though it is cached per
+/// primitive. Both go away by reading the two sets unconditionally and letting
+/// the material say which one to sample.
 macro_rules! insert_tex_coords {
-    ($reader:ident, $vertices:ident, $tex_coord_index:expr, $texture_name_coord:ident) => {
-        $reader
-            .read_tex_coords($tex_coord_index)
-            .unwrap()
-            .into_f32()
-            .enumerate()
-            .for_each(|(j, coord)| $vertices[j].$texture_name_coord = coord);
+    ($reader:ident, $vertices:ident, $set:expr, $field:ident) => {
+        if let Some(coords) = $reader.read_tex_coords($set) {
+            coords
+                .into_f32()
+                .enumerate()
+                .for_each(|(j, coord)| $vertices[j].$field = coord);
+        }
     };
+}
+
+/// Clamp a glTF `tex_coord` index to the sets the vertex format carries.
+fn clamp_tex_coord_set(set: u32, texture: &str) -> u32 {
+    if set > vulkan_abstraction::gltf::MAX_TEX_COORD_SET {
+        log::warn!(
+            "glTF {texture} texture uses TEXCOORD_{set}, but vertices only carry              TEXCOORD_0/1 — clamping to {}",
+            vulkan_abstraction::gltf::MAX_TEX_COORD_SET
+        );
+        vulkan_abstraction::gltf::MAX_TEX_COORD_SET
+    } else {
+        set
+    }
 }
 
 pub type PrimitiveDataMap = HashMap<vulkan_abstraction::gltf::PrimitiveUniqueKey, vulkan_abstraction::gltf::PrimitiveData>;
@@ -211,7 +233,7 @@ impl Gltf {
 
             let primitive_unique_key = (vertex_position_accessor_index, indices_accessor_index);
 
-            let (material, tex_coords, local_emissive_triangles) = {
+            let (material, local_emissive_triangles) = {
                 let material = primitive.material();
                 let material_pbr = primitive.material().pbr_metallic_roughness();
 
@@ -247,6 +269,11 @@ impl Gltf {
                     roughness_factor,
                     base_color_texture_index,
                     metallic_roughness_texture_index,
+                    base_color_tex_coord_set: clamp_tex_coord_set(base_color_tex_coord_index, "base colour"),
+                    metallic_roughness_tex_coord_set: clamp_tex_coord_set(
+                        metallic_roughness_tex_coord_index,
+                        "metallic-roughness",
+                    ),
                 };
 
                 let material = vulkan_abstraction::gltf::Material {
@@ -256,20 +283,15 @@ impl Gltf {
                     emissive_factor,
                     emissive_strength,
                     emissive_texture_index,
+                    normal_tex_coord_set: clamp_tex_coord_set(normal_tex_coord_index, "normal"),
+                    occlusion_tex_coord_set: clamp_tex_coord_set(occlusion_tex_coord_index, "occlusion"),
+                    emissive_tex_coord_set: clamp_tex_coord_set(emissive_tex_coord_index, "emissive"),
                     alpha_mode,
                     alpha_cutoff,
                     double_sided,
                     transmission_factor,
                     ior,
                 };
-
-                let tex_coords = (
-                    base_color_tex_coord_index,
-                    metallic_roughness_tex_coord_index,
-                    normal_tex_coord_index,
-                    occlusion_tex_coord_index,
-                    emissive_tex_coord_index,
-                );
 
                 let mut local_emissive_triangles = Vec::new();
 
@@ -305,7 +327,7 @@ impl Gltf {
                     }
                 }
 
-                (material, tex_coords, local_emissive_triangles)
+                (material, local_emissive_triangles)
             };
 
             if let std::collections::hash_map::Entry::Vacant(e) = primitive_data_map.entry(primitive_unique_key) {
@@ -343,13 +365,11 @@ impl Gltf {
                     vulkan_abstraction::IndexBuffer::new_for_blas_from_data(Arc::clone(&self.core), &indices)?
                 };
 
-                // This could also be done with zip, but the code would be equally long and with a lot of nested tuples
-                // I thought of moving the zip operation to a separate function but the type of reader doesn't allow you to pass it around
-                insert_tex_coords!(reader, vertices, tex_coords.0, base_color_tex_coord);
-                insert_tex_coords!(reader, vertices, tex_coords.1, metallic_roughness_tex_coord);
-                insert_tex_coords!(reader, vertices, tex_coords.2, normal_tex_coord);
-                insert_tex_coords!(reader, vertices, tex_coords.3, occlusion_tex);
-                insert_tex_coords!(reader, vertices, tex_coords.4, emissive_tex);
+                // Both UV sets, unconditionally — which one each texture samples is a
+                // material property (`Material::uv_set_mask`), not a vertex one, so the
+                // vertex buffer stays valid for every material sharing this primitive.
+                insert_tex_coords!(reader, vertices, 0, uv0);
+                insert_tex_coords!(reader, vertices, 1, uv1);
 
                 let vertex_buffer = vulkan_abstraction::VertexBuffer::new_for_blas_from_data(Arc::clone(&self.core), &vertices)?;
 
