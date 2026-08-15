@@ -68,18 +68,17 @@ pub struct DenoisePushConstant {
 }
 
 /// Heap-mode push constant for `shaders/denoise.slang`. Layout mirrors the
-/// shader's `DenoisePC` struct: five 8-byte `DescriptorHandle<>` slots followed
-/// by the same scalar tail as `DenoisePushConstant`. Each `[u32; 2]` is
-/// (slot_index, 0) — the high word is reserved by Slang.
+/// shader's `DenoisePC`: five heap slot indices followed by the same scalar tail
+/// as `DenoisePushConstant`.
 #[allow(dead_code)] // read by the gpu
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct DenoiseHeapPushConstant {
-    pub temporal_result: [u32; 2],
-    pub depth: [u32; 2],
-    pub normal: [u32; 2],
-    pub diffuse: [u32; 2],
-    pub spatial_output: [u32; 2],
+    pub temporal_result: u32,
+    pub depth: u32,
+    pub normal: u32,
+    pub diffuse: u32,
+    pub spatial_output: u32,
     pub frame_count: u32,
     pub step_width: i32,
     pub width: u32,
@@ -96,18 +95,17 @@ pub struct TemporalAccumulationPushConstant {
 }
 
 /// Heap-mode push constant for `shaders/temporal_accumulation.slang`. Layout
-/// mirrors the shader's `TemporalPC`: four 8-byte `DescriptorHandle<>` slots
-/// (each `[u32; 2]` = (slot_index, 0); the high word is reserved by Slang)
-/// followed by the scalar tail. All four images are bound as STORAGE, so the
-/// accumulation ping-pong stays in GENERAL the whole time.
+/// mirrors the shader's `TemporalPC`: four heap slot indices followed by the
+/// scalar tail. All four images are bound as STORAGE, so the accumulation
+/// ping-pong stays in GENERAL the whole time.
 #[allow(dead_code)] // read by the gpu
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct TemporalAccumulationHeapPushConstant {
-    pub raw_rt_color: [u32; 2],
-    pub motion_vector: [u32; 2],
-    pub history: [u32; 2],
-    pub accum_output: [u32; 2],
+    pub raw_rt_color: u32,
+    pub motion_vector: u32,
+    pub history: u32,
+    pub accum_output: u32,
     pub frame_count: u32,
     pub width: u32,
     pub height: u32,
@@ -117,12 +115,8 @@ pub struct TemporalAccumulationHeapPushConstant {
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct PostprocessPushConstant {
-    // Slang's `DescriptorHandle<T>` lowers to `uint2` (8 bytes); the `_pad` fields
-    // keep `output_idx` at offset 8 and `exposure` at offset 16 to match the shader.
     pub input_idx: u32,
-    pub _input_pad: u32,
     pub output_idx: u32,
-    pub _output_pad: u32,
     pub exposure: f32,
 }
 pub struct ComputePipeline<PushConstType> {

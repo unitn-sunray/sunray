@@ -30,13 +30,13 @@ struct GpuVertex {
     color: [u8; 4],
 }
 
-/// Push constant — matches `egui.slang`'s `EguiPC` (float2 + 2×DescriptorHandle).
+/// Push constant — matches `egui.slang`'s `EguiPC` (float2 + 2 heap slots).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct EguiPushConstant {
     screen_size_points: [f32; 2],
-    tex: [u32; 2],
-    samp: [u32; 2],
+    tex: u32,
+    samp: u32,
 }
 
 struct EguiTexture {
@@ -274,8 +274,8 @@ impl EguiPaint {
 
                     let pc = EguiPushConstant {
                         screen_size_points: screen,
-                        tex: [tex.image.sampled_slot(), 0],
-                        samp: [samp_slot, 0],
+                        tex: tex.image.sampled_slot(),
+                        samp: samp_slot,
                     };
                     let push_info = vk::PushDataInfoEXT::default().offset(0).data(vk::HostAddressRangeConstEXT {
                         address: &pc as *const _ as *const std::ffi::c_void,

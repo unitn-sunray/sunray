@@ -10,7 +10,7 @@ import rt_utils;
 
 [shader("closesthit")]
 void closest_hit(inout RayPayload payload, BuiltInTriangleIntersectionAttributes attribs) {
-    StructuredBuffer<MeshInfo> meshes = pc.meshes_info;
+    StructuredBuffer<MeshInfo> meshes = pc.get_meshes_info();
 
     float3 bary = float3(1.0 - attribs.barycentrics.x - attribs.barycentrics.y,
                          attribs.barycentrics.x,

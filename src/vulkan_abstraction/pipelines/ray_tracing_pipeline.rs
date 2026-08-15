@@ -19,45 +19,52 @@ pub struct RaytracingPushConstant {
     pub _padding: [u8; 3], //push constant size must be a multiple of 4
 }
 
-/// Push-constant layout for the heap-mode (Slang) raytracing pipeline. Every
-/// `DescriptorHandle<T>` field in `shaders/rt_types.slang::RaytracingPC`
-/// lowers to a `uint2`, so each is mirrored here as `[u32; 2]` (low word =
-/// heap shader index, high word = 0). Total size: 144 bytes — well within
-/// the 256-byte minimum push-constant range required by Vulkan.
+/// Push-constant layout for the heap-mode (Slang) raytracing pipeline. Mirrors
+/// `shaders/rt_types.slang::RaytracingPC` field for field — 80 bytes,
+/// against the 256 bytes this driver reports as `maxPushDataSize` (heap mode
+/// feeds the block through `vkCmdPushDataEXT`, so `maxPushConstantsSize` is not
+/// the limit that applies).
+///
+/// Every field but `tlas` is a bare heap slot index. Slang's `DescriptorHandle<T>` lowers
+/// to a `uint2` whose high word is never read, so the shader declares plain
+/// `uint`s and rebuilds the handle at the use site; see the comment on
+/// `RaytracingPC` for why.
 #[allow(dead_code)] // read by the gpu
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default)]
 pub struct RaytracingHeapPushConstant {
-    /// AS device address (uint64) instead of a heap-handle pair — workaround for
-    /// Slang issue #10671: `DescriptorHandle<RaytracingAccelerationStructure>` +
-    /// `spvDescriptorHeapEXT` omits `OpConvertUToAccelerationStructureKHR`, so
-    /// `TraceRayKHR` faults at runtime. The shader does the convert via inline
-    /// SPIR-V (`shaders/rt_utils.slang::tlas_from_address`). Switch back to a
-    /// `[u32; 2]` heap handle once the upstream Slang fix lands.
+    /// TLAS device address, not a heap slot. The shader runs
+    /// `OpConvertUToAccelerationStructureKHR` on it directly; see the `tlas`
+    /// comment in `shaders/rt_types.slang` for why the heap-handle form is
+    /// still unusable on this driver.
     pub tlas: u64,
-    pub raw_color: [u32; 2],
-    pub depth_img: [u32; 2],
-    pub normal_img: [u32; 2],
-    pub diffuse_img: [u32; 2],
-    pub motion_vec_img: [u32; 2],
-    /// Buffer-device-address of the matrices buffer (not a heap handle — see
-    /// `shaders/rt_types.slang::RaytracingPC.matrices`). Still 8 bytes, so the
-    /// rest of the struct layout is unchanged.
-    pub matrices: u64,
-    pub meshes_info: [u32; 2],
-    pub emissive_triangles: [u32; 2],
-    pub emissive_indirection: [u32; 2],
-    pub entity_transforms: [u32; 2],
-    pub blue_noise_tex: [u32; 2],
-    pub blue_noise_sampler: [u32; 2],
-    /// Buffer-device-addresses for the ping-pong reservoir buffers (see
-    /// `shaders/rt_types.slang::RaytracingPC.reservoirs`). 16 bytes total,
-    /// matching the previous `[[u32; 2]; 2]` heap-handle layout.
-    pub reservoirs: [u64; 2],
-    pub reservoirs_gi: [u64; 2],
+    pub raw_color: u32,
+    pub depth_img: u32,
+    pub normal_img: u32,
+    pub diffuse_img: u32,
+    pub motion_vec_img: u32,
+    pub matrices: u32,
+    pub meshes_info: u32,
+    pub emissive_triangles: u32,
+    pub emissive_indirection: u32,
+    pub entity_transforms: u32,
+    pub blue_noise_tex: u32,
+    pub blue_noise_sampler: u32,
+    /// Storage-buffer heap slots for the ping-pong reservoir buffers; the shader
+    /// picks current/history internally from `frame_count`.
+    pub reservoirs: [u32; 2],
+    pub reservoirs_gi: [u32; 2],
     pub frame_count: u32,
     pub use_srgb: u32,
 }
+
+// One u64 followed by 18 4-byte slots, no padding. The shader block is verified
+// to land on the same offsets (0, then 8,12,…,56,64,72,76). A mismatch here is
+// silent GPU garbage, not a validation error, so pin the size.
+const _: () = assert!(
+    size_of::<RaytracingHeapPushConstant>() == 80,
+    "RaytracingHeapPushConstant must stay in lockstep with RaytracingPC in shaders/rt_types.slang"
+);
 
 /// The four SPIR-V blobs a heap-mode ray-tracing pipeline links together — one
 /// per stage. The SBT/dispatch currently assumes exactly one raygen + one miss +

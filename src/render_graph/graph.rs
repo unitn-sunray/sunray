@@ -913,17 +913,20 @@ impl RenderGraph {
         })
     }
 
-    /// The device addresses of the persistent per-frame backing buffers of a
-    /// temporal *buffer* resource. Ping-pong buffers are still reached by device
-    /// address in the shader (the graph import only governs synchronization), so
-    /// the caller bakes these into its push constants.
-    pub fn temporal_buffer_addresses(
+    /// The storage-buffer heap slots of the persistent per-frame backing buffers
+    /// of a temporal *buffer* resource. The graph import governs only
+    /// synchronization; the shader reaches the buffer through the heap, so the
+    /// caller bakes these slots into its push constants.
+    ///
+    /// The backings are stable for the lifetime of the temporal resource, and
+    /// `storage_slot` caches on first call, so this does not churn the heap.
+    pub fn temporal_buffer_storage_slots(
         &self,
         exported: &ExportedTemporalResource<RawBuffer>,
-    ) -> [vk::DeviceAddress; MAX_FRAMES_IN_FLIGHT] {
+    ) -> [u32; MAX_FRAMES_IN_FLIGHT] {
         let imports = &self.temporal_resources[exported.index].imports;
         std::array::from_fn(|i| match &imports[i] {
-            GraphResourceImportInfo::Buffer { resource, .. } => resource.get_device_address(),
+            GraphResourceImportInfo::Buffer { resource, .. } => resource.storage_slot(),
             _ => unreachable!("temporal buffer resource backed by a non-buffer import"),
         })
     }

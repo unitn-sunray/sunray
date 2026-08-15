@@ -165,50 +165,78 @@ public struct ReservoirGI {
 }
 
 // --- Push constant ----------------------------------------------------------
-// Every binding from the old `RaytracingDescriptorSetLayout` is now a
-// `DescriptorHandle<T>` field here. `reservoirs[2]` and `reservoirs_gi[2]`
-// keep the same A/B ping-pong scheme, indexed by `frame_count & 1u`.
-// Texture access goes through the heap slots stored per material in
-// `MeshInfo` — there is no texture indirection buffer.
+// Every binding from the old `RaytracingDescriptorSetLayout` is a heap slot
+// index here. `reservoirs[2]` / `reservoirs_gi[2]` keep the A/B ping-pong
+// scheme, indexed by `frame_count & 1u`. Texture access goes through the heap
+// slots stored per material in `MeshInfo` — there is no indirection buffer.
+//
+// Fields are bare `uint`, not `DescriptorHandle<T>`, because the latter lowers
+// to a `uint2` whose high word is never read — 4 wasted bytes per resource.
+// The type each slot refers to is declared exactly once, in its accessor below;
+// `DescriptorHandle<T> h = { slot }` is the documented way to rebuild a handle
+// from an index. A generic `heap<T>(slot)` helper is not possible: the
+// `DescriptorHandle<T>` → `T` conversion only fires for concrete types
+// (`error[E30019]` inside any generic body), which is why these are written out.
+//
+// Keep in lockstep with `RaytracingHeapPushConstant` in
+// `src/vulkan_abstraction/pipelines/ray_tracing_pipeline.rs` — u64 + 18 × u32.
 public struct
 RaytracingPC {
-    // BDA-like uint64 instead of a DescriptorHandle<AS> — see
-    // `rt_utils.slang::tlas_from_address` for the workaround rationale
-    // (Slang issue #10671). Same 8-byte footprint, so the rest of the PC
-    // layout is unchanged.
+    // Still a raw device address, not a heap slot — Slang #10671 is only
+    // half-fixed. `DescriptorHandle<RaytracingAccelerationStructure>` now does
+    // emit the `OpConvertUToAccelerationStructureKHR` the issue was filed for,
+    // and the heap read itself is provably correct (verified 2026-08-15 on
+    // driver 610.88 / RTX 3060 Ti: the 8-byte-strided heap index resolves to the exact
+    // byte the AS descriptor was written to, and that descriptor holds precisely
+    // the device address). Feeding that loaded value to `TraceRay` still hangs
+    // the GPU, while the identical value taken from this push constant does not.
+    // Re-test the `DescriptorHandle` form on a Slang/driver bump; until then the
+    // convert stays fed from the push constant.
     public uint64_t tlas;
-    public DescriptorHandle<RWImage_r11f_g11f_b10f> raw_color;
-    public DescriptorHandle<RWImage_r16f>           depth_img;
-    public DescriptorHandle<RWImage_rgba8_snorm>    normal_img;
-    public DescriptorHandle<RWImage_r11f_g11f_b10f> diffuse_img;
-    public DescriptorHandle<RWImage_rg16f>          motion_vec_img;
+    public uint raw_color;
+    public uint depth_img;
+    public uint normal_img;
+    public uint diffuse_img;
+    public uint motion_vec_img;
 
-    // BDA pointer instead of a `DescriptorHandle<StructuredBuffer<Matrices>>` —
-    // Slang's heap-descriptor lowering miscomputes the storage class when
-    // accessing struct members of a `StructuredBuffer<T>` element, producing
-    // invalid SPIR-V. The `T*` (PhysicalStorageBuffer) path doesn't have that
-    // bug. The CPU push-constant field stays 8 bytes (a `uint64_t` device
-    // address instead of a `uint2` heap handle).
-    public Matrices* matrices;
-    public DescriptorHandle<StructuredBuffer<MeshInfo>> meshes_info;
-    public DescriptorHandle<StructuredBuffer<EmissiveTriangle>> emissive_triangles;
-    public DescriptorHandle<StructuredBuffer<EmissiveIndirectionEntry>> emissive_indirection;
-    public DescriptorHandle<StructuredBuffer<EntityTransform>> entity_transforms;
+    public uint matrices;
+    public uint meshes_info;
+    public uint emissive_triangles;
+    public uint emissive_indirection;
+    public uint entity_transforms;
 
-    public DescriptorHandle<Texture2D<float4>> blue_noise_tex;
-    public DescriptorHandle<SamplerState> blue_noise_sampler;
+    public uint blue_noise_tex;
+    public uint blue_noise_sampler;
 
-    // BDA pointers instead of `DescriptorHandle<RWStructuredBuffer<T>>` — Slang
-    // decomposes whole-struct writes into per-field stores with mismatched
-    // storage classes when the buffer is reached through the heap descriptor
-    // path, producing invalid SPIR-V. `Reservoir*` (PhysicalStorageBuffer)
-    // doesn't have that bug. Each pointer is 8 bytes, matching the previous
-    // `DescriptorHandle` lowering, so the rest of the PC layout is unchanged.
-    public Reservoir* reservoirs[2];
-    public ReservoirGI* reservoirs_gi[2];
+    public uint reservoirs[2];
+    public uint reservoirs_gi[2];
 
     public uint frame_count;
     public uint use_srgb;
+
+    public RaytracingAccelerationStructure get_tlas() {
+        return spirv_asm {
+            result:$$RaytracingAccelerationStructure = OpConvertUToAccelerationStructureKHR $tlas;
+        };
+    }
+
+    public RWImage_r11f_g11f_b10f get_raw_color()  { DescriptorHandle<RWImage_r11f_g11f_b10f> h = { raw_color };      return h; }
+    public RWImage_r16f           get_depth()      { DescriptorHandle<RWImage_r16f>           h = { depth_img };      return h; }
+    public RWImage_rgba8_snorm    get_normal()     { DescriptorHandle<RWImage_rgba8_snorm>    h = { normal_img };     return h; }
+    public RWImage_r11f_g11f_b10f get_diffuse()    { DescriptorHandle<RWImage_r11f_g11f_b10f> h = { diffuse_img };    return h; }
+    public RWImage_rg16f          get_motion_vec() { DescriptorHandle<RWImage_rg16f>          h = { motion_vec_img }; return h; }
+
+    public StructuredBuffer<Matrices>                get_matrices()             { DescriptorHandle<StructuredBuffer<Matrices>>                h = { matrices };             return h; }
+    public StructuredBuffer<MeshInfo>                get_meshes_info()          { DescriptorHandle<StructuredBuffer<MeshInfo>>                h = { meshes_info };          return h; }
+    public StructuredBuffer<EmissiveTriangle>        get_emissive_triangles()   { DescriptorHandle<StructuredBuffer<EmissiveTriangle>>        h = { emissive_triangles };   return h; }
+    public StructuredBuffer<EmissiveIndirectionEntry> get_emissive_indirection() { DescriptorHandle<StructuredBuffer<EmissiveIndirectionEntry>> h = { emissive_indirection }; return h; }
+    public StructuredBuffer<EntityTransform>         get_entity_transforms()    { DescriptorHandle<StructuredBuffer<EntityTransform>>         h = { entity_transforms };    return h; }
+
+    public Texture2D<float4> get_blue_noise_tex()     { DescriptorHandle<Texture2D<float4>> h = { blue_noise_tex };     return h; }
+    public SamplerState      get_blue_noise_sampler() { DescriptorHandle<SamplerState>      h = { blue_noise_sampler }; return h; }
+
+    public RWStructuredBuffer<Reservoir>   get_reservoir(uint i)    { DescriptorHandle<RWStructuredBuffer<Reservoir>>   h = { reservoirs[i] };    return h; }
+    public RWStructuredBuffer<ReservoirGI> get_reservoir_gi(uint i) { DescriptorHandle<RWStructuredBuffer<ReservoirGI>> h = { reservoirs_gi[i] }; return h; }
 }
 
 public static const uint NULL_TEXTURE = 0xFFFFFFFFu;

@@ -9,26 +9,26 @@ import rt_utils;
 
 [shader("raygeneration")]
 void ray_gen_final() {
-    RaytracingAccelerationStructure tlas = tlas_from_address(pc.tlas);
+    RaytracingAccelerationStructure tlas = pc.get_tlas();
     // CPU pre-transposes (see `set_matrices` in resource_manager.rs); each
     // float4 here is already a row of the intended matrix.
-    Matrices m = *pc.matrices;
+    Matrices m = pc.get_matrices()[0];
     float4x4 mat_view_inverse = float4x4(m.vi0, m.vi1, m.vi2, m.vi3);
     float4x4 mat_proj_inverse = float4x4(m.pi0, m.pi1, m.pi2, m.pi3);
-    StructuredBuffer<EmissiveTriangle> emissive_triangles = pc.emissive_triangles;
-    StructuredBuffer<EmissiveIndirectionEntry> emissive_indirection = pc.emissive_indirection;
-    StructuredBuffer<EntityTransform> entity_transforms = pc.entity_transforms;
-    RWImage_r11f_g11f_b10f raw_color   = pc.raw_color;
-    RWImage_r16f           depth_img   = pc.depth_img;
-    RWImage_rgba8_snorm    normal_img  = pc.normal_img;
-    RWImage_rg16f          motion_vec_img = pc.motion_vec_img;
+    StructuredBuffer<EmissiveTriangle> emissive_triangles = pc.get_emissive_triangles();
+    StructuredBuffer<EmissiveIndirectionEntry> emissive_indirection = pc.get_emissive_indirection();
+    StructuredBuffer<EntityTransform> entity_transforms = pc.get_entity_transforms();
+    RWImage_r11f_g11f_b10f raw_color   = pc.get_raw_color();
+    RWImage_r16f           depth_img   = pc.get_depth();
+    RWImage_rgba8_snorm    normal_img  = pc.get_normal();
+    RWImage_rg16f          motion_vec_img = pc.get_motion_vec();
 
     uint cur_buf = current_reservoir_idx(pc.frame_count);
-    Reservoir*   reservoir_cur    = pc.reservoirs[cur_buf];
-    ReservoirGI* reservoir_gi_cur = pc.reservoirs_gi[cur_buf];
+    RWStructuredBuffer<Reservoir>   reservoir_cur    = pc.get_reservoir(cur_buf);
+    RWStructuredBuffer<ReservoirGI> reservoir_gi_cur = pc.get_reservoir_gi(cur_buf);
 
-    Texture2D<float4> blue_noise_tex = pc.blue_noise_tex;
-    SamplerState blue_noise_sampler  = pc.blue_noise_sampler;
+    Texture2D<float4> blue_noise_tex = pc.get_blue_noise_tex();
+    SamplerState blue_noise_sampler  = pc.get_blue_noise_sampler();
 
     uint2 launch_size = DispatchRaysDimensions().xy;
     uint2 launch_id   = DispatchRaysIndex().xy;

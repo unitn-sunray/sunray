@@ -4,16 +4,24 @@
 
 import rt_types;  // RWImage_* format aliases (see the comment on them)
 
+// Heap slots are bare `uint`, not `DescriptorHandle<T>` (which lowers to a
+// `uint2` whose high word is never read). Accessors below name the type once.
 struct DenoisePC {
-    DescriptorHandle<RWImage_r11f_g11f_b10f> temporal_result;
-    DescriptorHandle<Texture2D<float4>> depth;
-    DescriptorHandle<Texture2D<float4>> normal;
-    DescriptorHandle<Texture2D<float4>> diffuse;
-    DescriptorHandle<RWImage_r11f_g11f_b10f> spatial_output;
+    uint temporal_result;
+    uint depth;
+    uint normal;
+    uint diffuse;
+    uint spatial_output;
     uint frame_count;
     int step_width;
     uint width;
     uint height;
+
+    RWImage_r11f_g11f_b10f get_temporal_result() { DescriptorHandle<RWImage_r11f_g11f_b10f> h = { temporal_result }; return h; }
+    RWImage_r11f_g11f_b10f get_spatial_output()  { DescriptorHandle<RWImage_r11f_g11f_b10f> h = { spatial_output };  return h; }
+    Texture2D<float4>      get_depth()           { DescriptorHandle<Texture2D<float4>>      h = { depth };           return h; }
+    Texture2D<float4>      get_normal()          { DescriptorHandle<Texture2D<float4>>      h = { normal };          return h; }
+    Texture2D<float4>      get_diffuse()         { DescriptorHandle<Texture2D<float4>>      h = { diffuse };         return h; }
 }
 
 [vk::push_constant]
@@ -29,11 +37,11 @@ static const float kernel[5] = { 1.0/16.0, 4.0/16.0, 6.0/16.0, 4.0/16.0, 1.0/16.
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void main(uint3 tid: SV_DispatchThreadID) {
-    RWImage_r11f_g11f_b10f temporal_result = pc.temporal_result;
-    Texture2D<float4> depth = pc.depth;
-    Texture2D<float4> normal = pc.normal;
-    Texture2D<float4> diffuse = pc.diffuse;
-    RWImage_r11f_g11f_b10f spatial_output = pc.spatial_output;
+    RWImage_r11f_g11f_b10f temporal_result = pc.get_temporal_result();
+    Texture2D<float4> depth = pc.get_depth();
+    Texture2D<float4> normal = pc.get_normal();
+    Texture2D<float4> diffuse = pc.get_diffuse();
+    RWImage_r11f_g11f_b10f spatial_output = pc.get_spatial_output();
 
     int2 size = int2(pc.width, pc.height);
     int2 pixel_coords = int2(tid.xy);

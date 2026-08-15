@@ -232,10 +232,10 @@ pub struct Renderer<K: Hash + Eq + Copy + Send + 'static = ResourceKey> {
 
 /// Per-frame GPU inputs of the unified graph that live in frame-local buffers
 /// (created on the spot in `render`, deferred-freed via the end-of-frame
-/// callbacks): the camera matrices UBO address and the heap slots of the flat
+/// callbacks): the heap slots of the camera matrices UBO and of the flat
 /// transform / emissive indirection buffers.
 struct FrameGpuData {
-    matrices_address: vk::DeviceAddress,
+    matrices_slot: u32,
     entity_transforms_slot: u32,
     emissive_indirection_slot: u32,
 }
@@ -1027,7 +1027,7 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
             view_proj: view_proj.transpose(),
             prev_view_proj: prev_view_proj.transpose(),
         };
-        let matrices_address = self.matrices_pool[matrices_slot].get_device_address();
+        let matrices_heap_slot = self.matrices_pool[matrices_slot].storage_slot();
 
         let frame_data = self.resource_manager.frame_instance_data(instances)?;
         let instance_count = frame_data.as_instances.len() as u32;
@@ -1092,7 +1092,7 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
         // callback that frees it is already tagged with this frame.
 
         let frame_gpu_data = FrameGpuData {
-            matrices_address,
+            matrices_slot: matrices_heap_slot,
             entity_transforms_slot: transforms_buffer.raw().storage_slot(),
             emissive_indirection_slot: emissive_indirection_buffer.raw().storage_slot(),
         };
@@ -1347,29 +1347,27 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
         let accum_idx = (frame_count % 2) as usize;
         let history_idx = ((frame_count + 1) % 2) as usize;
 
-        let pack = |i: u32| -> [u32; 2] { [i, 0] };
-
         // Non-image fields of the RT push constant: stable slots come from the
-        // resource manager, the per-frame ones (matrices address, transforms /
-        // emissive indirection slots) from this frame's local buffers. The five
-        // RT-output image slots are filled inside the closure from the graph's
-        // transient resources (they're created per frame).
+        // resource manager, the per-frame ones (matrices, transforms / emissive
+        // indirection slots) from this frame's local buffers. The five RT-output
+        // image slots are filled inside the closure from the graph's transient
+        // resources (they're created per frame).
         // `tlas` is filled below with the address returned by `queue_tlas_build`
         // (a rebuild yields a fresh structure with a new address); 0 here is a
         // placeholder that is always overwritten before the RT passes are added.
         let mut rt_pc_base = vulkan_abstraction::RaytracingHeapPushConstant {
             tlas: 0,
-            matrices: frame_gpu_data.matrices_address,
-            meshes_info: pack(self.resource_manager.meshes_info_storage_slot()),
-            emissive_triangles: pack(self.resource_manager.emissive_triangles_storage_slot()),
-            emissive_indirection: pack(frame_gpu_data.emissive_indirection_slot),
-            entity_transforms: pack(frame_gpu_data.entity_transforms_slot),
-            blue_noise_tex: pack(self.blue_noise_image.sampled_slot()),
-            blue_noise_sampler: pack(self.blue_noise_sampler.slot()),
-            // Device addresses of the graph-owned ping-pong reservoir backings;
-            // the shader picks current/history internally via `frame_count`.
-            reservoirs: self.render_graph.temporal_buffer_addresses(&self.reservoir_temporal),
-            reservoirs_gi: self.render_graph.temporal_buffer_addresses(&self.reservoir_gi_temporal),
+            matrices: frame_gpu_data.matrices_slot,
+            meshes_info: self.resource_manager.meshes_info_storage_slot(),
+            emissive_triangles: self.resource_manager.emissive_triangles_storage_slot(),
+            emissive_indirection: frame_gpu_data.emissive_indirection_slot,
+            entity_transforms: frame_gpu_data.entity_transforms_slot,
+            blue_noise_tex: self.blue_noise_image.sampled_slot(),
+            blue_noise_sampler: self.blue_noise_sampler.slot(),
+            // Heap slots of the graph-owned ping-pong reservoir backings; the
+            // shader picks current/history internally via `frame_count`.
+            reservoirs: self.render_graph.temporal_buffer_storage_slots(&self.reservoir_temporal),
+            reservoirs_gi: self.render_graph.temporal_buffer_storage_slots(&self.reservoir_gi_temporal),
             frame_count,
             use_srgb: if self.image_format == vk::Format::R8G8B8A8_SRGB {
                 1
@@ -1658,13 +1656,12 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
         diffuse_h: &Handle<vulkan_abstraction::Image>,
         motion_h: &Handle<vulkan_abstraction::Image>,
     ) -> SrResult<Vec<u8>> {
-        let pack = |i: u32| -> [u32; 2] { [i, 0] };
         let mut pc = *pc_base;
-        pc.raw_color = pack(tr.image(raw_color_h)?.storage_slot());
-        pc.depth_img = pack(tr.image(depth_h)?.storage_slot());
-        pc.normal_img = pack(tr.image(normal_h)?.storage_slot());
-        pc.diffuse_img = pack(tr.image(diffuse_h)?.storage_slot());
-        pc.motion_vec_img = pack(tr.image(motion_h)?.storage_slot());
+        pc.raw_color = tr.image(raw_color_h)?.storage_slot();
+        pc.depth_img = tr.image(depth_h)?.storage_slot();
+        pc.normal_img = tr.image(normal_h)?.storage_slot();
+        pc.diffuse_img = tr.image(diffuse_h)?.storage_slot();
+        pc.motion_vec_img = tr.image(motion_h)?.storage_slot();
         // `RaytracingHeapPushConstant` is `#[repr(C)]` plain data, so a verbatim
         // byte copy matches the shader's push-constant layout.
         let bytes = unsafe {
@@ -1820,12 +1817,11 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
             .common(common.build())
             .shaders(ComputeShaders::new(vec![ShaderSource::Spirv(spirv.to_vec())], 0, "main"))
             .generate_render(rg, [width.div_ceil(16), height.div_ceil(16), 1], move |tr| {
-                let pack = |i: u32| -> [u32; 2] { [i, 0] };
                 Ok(vulkan_abstraction::TemporalAccumulationHeapPushConstant {
-                    raw_rt_color: pack(tr.image(&raw_color_h)?.storage_slot()),
-                    motion_vector: pack(tr.image(&motion_h)?.storage_slot()),
-                    history: pack(tr.image(&history_h)?.storage_slot()),
-                    accum_output: pack(tr.image(&accum_target_h)?.storage_slot()),
+                    raw_rt_color: tr.image(&raw_color_h)?.storage_slot(),
+                    motion_vector: tr.image(&motion_h)?.storage_slot(),
+                    history: tr.image(&history_h)?.storage_slot(),
+                    accum_output: tr.image(&accum_target_h)?.storage_slot(),
                     frame_count,
                     width,
                     height,
@@ -1892,13 +1888,12 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
                 .common(common.build())
                 .shaders(ComputeShaders::new(vec![ShaderSource::Spirv(spirv.to_vec())], 0, "main"))
                 .generate_render(rg, [width.div_ceil(16), height.div_ceil(16), 1], move |tr| {
-                    let pack = |i: u32| -> [u32; 2] { [i, 0] };
                     Ok(vulkan_abstraction::DenoiseHeapPushConstant {
-                        temporal_result: pack(tr.image(&read_h_c)?.storage_slot()),
-                        depth: pack(tr.image(&depth_c)?.sampled_slot()),
-                        normal: pack(tr.image(&normal_c)?.sampled_slot()),
-                        diffuse: pack(tr.image(&diffuse_c)?.sampled_slot()),
-                        spatial_output: pack(tr.image(&write_h_c)?.storage_slot()),
+                        temporal_result: tr.image(&read_h_c)?.storage_slot(),
+                        depth: tr.image(&depth_c)?.sampled_slot(),
+                        normal: tr.image(&normal_c)?.sampled_slot(),
+                        diffuse: tr.image(&diffuse_c)?.sampled_slot(),
+                        spatial_output: tr.image(&write_h_c)?.storage_slot(),
                         frame_count,
                         step_width,
                         width,
@@ -1933,9 +1928,7 @@ impl<K: Hash + Eq + Copy + Send + 'static> Renderer<K> {
             .generate_render(rg, [width.div_ceil(16), height.div_ceil(16), 1], move |tr| {
                 Ok(PostprocessPushConstant {
                     input_idx: tr.image(&denoise_in_h)?.storage_slot(),
-                    _input_pad: 0,
                     output_idx: tr.image(&postprocess_out_h)?.storage_slot(),
-                    _output_pad: 0,
                     exposure,
                 })
             })

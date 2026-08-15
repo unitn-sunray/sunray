@@ -16,14 +16,21 @@
 
 import rt_types;  // RWImage_* format aliases (see the comment on them)
 
+// Heap slots are bare `uint`, not `DescriptorHandle<T>` (which lowers to a
+// `uint2` whose high word is never read). Accessors below name the type once.
 struct TemporalPC {
-    DescriptorHandle<RWImage_r11f_g11f_b10f> raw_rt_color; // RT raw color   (storage read)
-    DescriptorHandle<RWImage_rg16f> motion_vector;         // rg motion      (storage read)
-    DescriptorHandle<RWImage_r11f_g11f_b10f> history;      // accum[history] (storage read, manual bilinear)
-    DescriptorHandle<RWImage_r11f_g11f_b10f> accum_output; // accum[target]  (storage write)
+    uint raw_rt_color;   // RT raw color   (storage read)
+    uint motion_vector;  // rg motion      (storage read)
+    uint history;        // accum[history] (storage read, manual bilinear)
+    uint accum_output;   // accum[target]  (storage write)
     uint frame_count;
     uint width;
     uint height;
+
+    RWImage_r11f_g11f_b10f get_raw_rt_color() { DescriptorHandle<RWImage_r11f_g11f_b10f> h = { raw_rt_color }; return h; }
+    RWImage_rg16f          get_motion()       { DescriptorHandle<RWImage_rg16f>          h = { motion_vector }; return h; }
+    RWImage_r11f_g11f_b10f get_history()      { DescriptorHandle<RWImage_r11f_g11f_b10f> h = { history };      return h; }
+    RWImage_r11f_g11f_b10f get_accum_output() { DescriptorHandle<RWImage_r11f_g11f_b10f> h = { accum_output }; return h; }
 }
 
 [vk::push_constant]
@@ -67,10 +74,10 @@ void main(
     uint group_index: SV_GroupIndex,
     uint3 dispatch_thread_id: SV_DispatchThreadID
 ) {
-    RWImage_r11f_g11f_b10f raw_rt_color = pc.raw_rt_color;
-    RWImage_rg16f          motion_vector = pc.motion_vector;
-    RWImage_r11f_g11f_b10f history = pc.history;
-    RWImage_r11f_g11f_b10f accum_output = pc.accum_output;
+    RWImage_r11f_g11f_b10f raw_rt_color = pc.get_raw_rt_color();
+    RWImage_rg16f          motion_vector = pc.get_motion();
+    RWImage_r11f_g11f_b10f history = pc.get_history();
+    RWImage_r11f_g11f_b10f accum_output = pc.get_accum_output();
 
     // imageSize() is unreliable on this driver, so the dispatch extent comes via
     // the push constant (matches the GLSL note).

@@ -9,10 +9,15 @@
 // NOTE: gamma/premultiply handling is the classic egui tuning point — if colors
 // look washed out or too dark, this `linear_from_srgb` step is the first knob.
 
+// Heap slots are bare `uint`, not `DescriptorHandle<T>` (which lowers to a
+// `uint2` whose high word is never read). Accessors below name the type once.
 struct EguiPC {
-    float2 screen_size_points;                   // logical window size (points)
-    DescriptorHandle<Texture2D<float4>> tex;     // font / user texture (gamma, premultiplied)
-    DescriptorHandle<SamplerState> samp;
+    float2 screen_size_points;   // logical window size (points)
+    uint tex;                    // font / user texture (gamma, premultiplied)
+    uint samp;
+
+    Texture2D<float4> get_tex()  { DescriptorHandle<Texture2D<float4>> h = { tex };  return h; }
+    SamplerState      get_samp() { DescriptorHandle<SamplerState>      h = { samp }; return h; }
 };
 
 [vk::push_constant]
@@ -48,8 +53,8 @@ float3 linear_from_srgb(float3 srgb) {
 
 [shader("fragment")]
 float4 fragment_main(VSOut input) : SV_Target {
-    Texture2D<float4> tex = pc.tex;
-    SamplerState samp = pc.samp;
+    Texture2D<float4> tex = pc.get_tex();
+    SamplerState samp = pc.get_samp();
     float4 tex_gamma = tex.Sample(samp, input.uv); // premultiplied, gamma space
     float4 out_gamma = input.color * tex_gamma;    // egui blend math (gamma space)
     return float4(linear_from_srgb(out_gamma.rgb), out_gamma.a);

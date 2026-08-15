@@ -10,30 +10,29 @@ import rt_utils;
 
 [shader("raygeneration")]
 void ray_gen_ris() {
-    RaytracingAccelerationStructure tlas = tlas_from_address(pc.tlas);
-    // Read matrices via the BDA pointer (see `RaytracingPC.matrices` comment).
+    RaytracingAccelerationStructure tlas = pc.get_tlas();
     // The CPU side (`set_matrices` in resource_manager.rs) transposes each
     // matrix before upload, so each float4 here IS a row of the intended
     // matrix — `float4x4(rows...)` reconstructs it directly.
-    Matrices m = *pc.matrices;
+    Matrices m = pc.get_matrices()[0];
     float4x4 mat_view_inverse   = float4x4(m.vi0, m.vi1, m.vi2, m.vi3);
     float4x4 mat_proj_inverse   = float4x4(m.pi0, m.pi1, m.pi2, m.pi3);
     float4x4 mat_prev_view_proj = float4x4(m.pp0, m.pp1, m.pp2, m.pp3);
-    StructuredBuffer<EmissiveTriangle> emissive_triangles = pc.emissive_triangles;
-    StructuredBuffer<EmissiveIndirectionEntry> emissive_indirection = pc.emissive_indirection;
-    StructuredBuffer<EntityTransform> entity_transforms = pc.entity_transforms;
+    StructuredBuffer<EmissiveTriangle> emissive_triangles = pc.get_emissive_triangles();
+    StructuredBuffer<EmissiveIndirectionEntry> emissive_indirection = pc.get_emissive_indirection();
+    StructuredBuffer<EntityTransform> entity_transforms = pc.get_entity_transforms();
 
-    RWImage_r16f           depth_img      = pc.depth_img;
-    RWImage_rgba8_snorm    normal_img     = pc.normal_img;
-    RWImage_r11f_g11f_b10f diffuse_img    = pc.diffuse_img;
-    RWImage_rg16f          motion_vec_img = pc.motion_vec_img;
+    RWImage_r16f           depth_img      = pc.get_depth();
+    RWImage_rgba8_snorm    normal_img     = pc.get_normal();
+    RWImage_r11f_g11f_b10f diffuse_img    = pc.get_diffuse();
+    RWImage_rg16f          motion_vec_img = pc.get_motion_vec();
 
     uint cur_buf  = current_reservoir_idx(pc.frame_count);
     uint hist_buf = history_reservoir_idx(pc.frame_count);
-    Reservoir*   reservoir_cur     = pc.reservoirs[cur_buf];
-    Reservoir*   reservoir_hist    = pc.reservoirs[hist_buf];
-    ReservoirGI* reservoir_gi_cur  = pc.reservoirs_gi[cur_buf];
-    ReservoirGI* reservoir_gi_hist = pc.reservoirs_gi[hist_buf];
+    RWStructuredBuffer<Reservoir>   reservoir_cur     = pc.get_reservoir(cur_buf);
+    RWStructuredBuffer<Reservoir>   reservoir_hist    = pc.get_reservoir(hist_buf);
+    RWStructuredBuffer<ReservoirGI> reservoir_gi_cur  = pc.get_reservoir_gi(cur_buf);
+    RWStructuredBuffer<ReservoirGI> reservoir_gi_hist = pc.get_reservoir_gi(hist_buf);
 
     uint2 launch_size = DispatchRaysDimensions().xy;
     uint2 launch_id   = DispatchRaysIndex().xy;

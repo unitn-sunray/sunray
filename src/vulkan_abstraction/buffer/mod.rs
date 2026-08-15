@@ -55,6 +55,14 @@ pub trait Buffer: Send + Sync {
     fn byte_size(&self) -> vk::DeviceSize;
     fn is_null(&self) -> bool;
     fn get_device_address(&self) -> vk::DeviceAddress;
+
+    /// Heap slot of this buffer's `STORAGE_BUFFER` descriptor — what the Slang
+    /// shaders index to reach it as a `StructuredBuffer<T>`. Lazily allocated
+    /// and cached on the underlying [`RawBuffer`], so repeated calls are cheap
+    /// and stable.
+    fn storage_slot(&self) -> u32 {
+        self.raw().storage_slot()
+    }
     fn new_null(core: Arc<vulkan_abstraction::Core>) -> Self
     where
         Self: Sized;

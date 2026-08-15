@@ -9,7 +9,7 @@ import rt_utils;
 
 [shader("anyhit")]
 void any_hit(inout RayPayload payload, BuiltInTriangleIntersectionAttributes attribs) {
-    StructuredBuffer<MeshInfo> meshes = pc.meshes_info;
+    StructuredBuffer<MeshInfo> meshes = pc.get_meshes_info();
 
     uint blas_instance_id = InstanceID();
     MeshInfo mesh_info = meshes[blas_instance_id];

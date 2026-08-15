@@ -11,25 +11,6 @@ import rt_types;
 // and passes it (or its fields) into these helpers explicitly. Slang doesn't
 // share globals across modules, so we keep the helpers pure.
 
-// --- TLAS workaround (Slang issue #10671) ----------------------------------
-// `DescriptorHandle<RaytracingAccelerationStructure>` + `spvDescriptorHeapEXT`
-// emits the heap load (`OpUntypedAccessChainKHR` + `OpLoad`) but FORGETS the
-// `OpConvertUToAccelerationStructureKHR` step — the loaded uint64 is then used
-// as if it were already an AS handle, which fails at `OpTraceRayKHR` with
-// VK_ERROR_DEVICE_LOST on NVIDIA. The fix is in flight (Slang PR for #10671).
-//
-// Temp workaround: push the TLAS's `vkGetAccelerationStructureDeviceAddressKHR`
-// result as a raw `uint64_t` in the push constant and run the missing convert
-// op ourselves via inline SPIR-V. The PC field stays 8 bytes, so no layout
-// shift. Delete this helper and switch `RaytracingPC.tlas` back to
-// `DescriptorHandle<RaytracingAccelerationStructure>` once the Slang patch
-// lands.
-public RaytracingAccelerationStructure tlas_from_address(uint64_t address) {
-    return spirv_asm {
-        result:$$RaytracingAccelerationStructure = OpConvertUToAccelerationStructureKHR $address;
-    };
-}
-
 // --- RNG (PCG, one seed per thread) -----------------------------------------
 public struct Rng {
     public uint seed;
