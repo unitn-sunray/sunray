@@ -1,9 +1,11 @@
 // Postprocess: tonemap + gamma. First Slang shader in the project, used to
 // validate the VK_EXT_descriptor_heap path end-to-end before porting the rest.
 
+import rt_types;  // RWImage_* format aliases (see the comment on them)
+
 struct PostprocessPC {
-    DescriptorHandle<RWTexture2D<float4>> input;   // r11g11b10f HDR (read as float4)
-    DescriptorHandle<RWTexture2D<float4>> output;  // rgba8 LDR
+    DescriptorHandle<RWImage_r11f_g11f_b10f> input;   // final denoise output, HDR
+    DescriptorHandle<RWImage_rgba8>          output;  // postprocess result, LDR
     float exposure;
 }
 
@@ -20,8 +22,8 @@ float3 aces_film(float3 x) {
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void main(uint3 tid: SV_DispatchThreadID) {
-    RWTexture2D<float4> src = pc.input;
-    RWTexture2D<float4> dst = pc.output;
+    RWImage_r11f_g11f_b10f src = pc.input;
+    RWImage_rgba8          dst = pc.output;
 
     uint2 size;
     dst.GetDimensions(size.x, size.y);

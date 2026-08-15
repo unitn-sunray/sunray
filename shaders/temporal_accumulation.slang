@@ -14,11 +14,13 @@
 #define TILE_BORDER 1
 #define TILE_FULL (TILE_SIZE + 2 * TILE_BORDER) // 18
 
+import rt_types;  // RWImage_* format aliases (see the comment on them)
+
 struct TemporalPC {
-    DescriptorHandle<RWTexture2D<float4>> raw_rt_color;    // RT raw color   (storage read)
-    DescriptorHandle<RWTexture2D<float2>> motion_vector;   // rg motion      (storage read)
-    DescriptorHandle<RWTexture2D<float4>> history;         // accum[history] (storage read, manual bilinear)
-    DescriptorHandle<RWTexture2D<float4>> accum_output;    // accum[target]  (storage write)
+    DescriptorHandle<RWImage_r11f_g11f_b10f> raw_rt_color; // RT raw color   (storage read)
+    DescriptorHandle<RWImage_rg16f> motion_vector;         // rg motion      (storage read)
+    DescriptorHandle<RWImage_r11f_g11f_b10f> history;      // accum[history] (storage read, manual bilinear)
+    DescriptorHandle<RWImage_r11f_g11f_b10f> accum_output; // accum[target]  (storage write)
     uint frame_count;
     uint width;
     uint height;
@@ -39,7 +41,7 @@ float get_luminance(float3 color) {
 
 // Bilinear sample of a storage image at a continuous uv (clamp-to-edge), used to
 // reproject the history buffer. Equivalent to a LINEAR/CLAMP sampler.
-float3 sample_history_bilinear(RWTexture2D<float4> history, float2 uv, int2 size) {
+float3 sample_history_bilinear(RWImage_r11f_g11f_b10f history, float2 uv, int2 size) {
     float2 p = uv * float2(size) - 0.5;
     int2 base = int2(floor(p));
     float2 f = p - float2(base);
@@ -65,10 +67,10 @@ void main(
     uint group_index: SV_GroupIndex,
     uint3 dispatch_thread_id: SV_DispatchThreadID
 ) {
-    RWTexture2D<float4> raw_rt_color = pc.raw_rt_color;
-    RWTexture2D<float2> motion_vector = pc.motion_vector;
-    RWTexture2D<float4> history = pc.history;
-    RWTexture2D<float4> accum_output = pc.accum_output;
+    RWImage_r11f_g11f_b10f raw_rt_color = pc.raw_rt_color;
+    RWImage_rg16f          motion_vector = pc.motion_vector;
+    RWImage_r11f_g11f_b10f history = pc.history;
+    RWImage_r11f_g11f_b10f accum_output = pc.accum_output;
 
     // imageSize() is unreliable on this driver, so the dispatch extent comes via
     // the push constant (matches the GLSL note).

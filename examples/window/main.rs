@@ -306,6 +306,13 @@ impl App {
                 log::warn!("{e}");
             } else {
                 log::error!("{e}");
+                // This path exits the loop and returns from `main` normally, so neither
+                // the panic hook nor the exception filter fires — wait here instead, or
+                // an error like ERROR_DEVICE_LOST scrolls past as the console closes.
+                if io::stdin().is_terminal() {
+                    println!("\nPress Enter to exit...");
+                    let _ = io::stdin().read(&mut [0u8]);
+                }
                 event_loop.exit();
             }
         }
@@ -375,6 +382,45 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Keep the console open when the process dies *without* a Rust panic.
+///
+/// The NVIDIA driver crash (`docs/NVIDIA_BUG_REPORT.md`) is a `STATUS_ACCESS_VIOLATION`
+/// raised on a driver worker thread, so the panic hook in `main` never runs and the
+/// window closes with everything still on screen unread. The top-level exception filter
+/// is the last application code that gets to run.
+///
+/// `SetUnhandledExceptionFilter`, not `AddVectoredExceptionHandler`: a VEH sees every
+/// *first-chance* exception, including ones the driver raises and handles itself, so it
+/// would block on exceptions that were never fatal. This one fires only when nothing
+/// handled it. Returning `EXCEPTION_CONTINUE_SEARCH` hands the crash on to WER
+/// afterwards, so the dumps the bug report is built from still get written.
+///
+/// Raw FFI against kernel32 rather than a `windows-sys` dependency for two functions.
+#[cfg(windows)]
+fn wait_on_hard_crash() {
+    use std::ffi::c_void;
+
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+
+    unsafe extern "system" {
+        fn SetUnhandledExceptionFilter(
+            filter: unsafe extern "system" fn(*mut c_void) -> i32,
+        ) -> *mut c_void;
+    }
+
+    // `EXCEPTION_POINTERS` begins with `*mut EXCEPTION_RECORD`, which begins with the
+    // `u32` exception code. That code is the only field wanted, so neither struct is
+    // declared in full.
+    unsafe extern "system" fn on_unhandled(info: *mut c_void) -> i32 {
+        let code = unsafe { *(*info.cast::<*const u32>()) };
+        println!("\nCrashed with exception 0x{code:08X} — press Enter to exit...");
+        let _ = io::stdin().read(&mut [0u8]);
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    unsafe { SetUnhandledExceptionFilter(on_unhandled) };
+}
+
 fn main() {
     log4rs::config::init_file("examples/log4rs.yaml", log4rs::config::Deserializers::new()).unwrap();
 
@@ -389,6 +435,9 @@ fn main() {
             println!("\nPress Enter to exit...");
             let _ = io::stdin().read(&mut [0u8]);
         }));
+        // Same tty gate, same reason: a crash must not become a hang under CI.
+        #[cfg(windows)]
+        wait_on_hard_crash();
     }
 
     if cfg!(debug_assertions) {

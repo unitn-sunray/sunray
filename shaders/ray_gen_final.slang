@@ -18,10 +18,10 @@ void ray_gen_final() {
     StructuredBuffer<EmissiveTriangle> emissive_triangles = pc.emissive_triangles;
     StructuredBuffer<EmissiveIndirectionEntry> emissive_indirection = pc.emissive_indirection;
     StructuredBuffer<EntityTransform> entity_transforms = pc.entity_transforms;
-    RWTexture2D<float4> raw_color   = pc.raw_color;
-    RWTexture2D<float>  depth_img   = pc.depth_img;
-    RWTexture2D<float4> normal_img  = pc.normal_img;
-    RWTexture2D<float2> motion_vec_img = pc.motion_vec_img;
+    RWImage_r11f_g11f_b10f raw_color   = pc.raw_color;
+    RWImage_r16f           depth_img   = pc.depth_img;
+    RWImage_rgba8_snorm    normal_img  = pc.normal_img;
+    RWImage_rg16f          motion_vec_img = pc.motion_vec_img;
 
     uint cur_buf = current_reservoir_idx(pc.frame_count);
     Reservoir*   reservoir_cur    = pc.reservoirs[cur_buf];

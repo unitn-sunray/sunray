@@ -2,12 +2,14 @@
 // Reads temporal_result (storage), depth/normal/diffuse (sampled), writes spatial_output (storage).
 // All bindings come through `DescriptorHandle<>` slot indices in the push constant.
 
+import rt_types;  // RWImage_* format aliases (see the comment on them)
+
 struct DenoisePC {
-    DescriptorHandle<RWTexture2D<float4>> temporal_result;
+    DescriptorHandle<RWImage_r11f_g11f_b10f> temporal_result;
     DescriptorHandle<Texture2D<float4>> depth;
     DescriptorHandle<Texture2D<float4>> normal;
     DescriptorHandle<Texture2D<float4>> diffuse;
-    DescriptorHandle<RWTexture2D<float4>> spatial_output;
+    DescriptorHandle<RWImage_r11f_g11f_b10f> spatial_output;
     uint frame_count;
     int step_width;
     uint width;
@@ -27,11 +29,11 @@ static const float kernel[5] = { 1.0/16.0, 4.0/16.0, 6.0/16.0, 4.0/16.0, 1.0/16.
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void main(uint3 tid: SV_DispatchThreadID) {
-    RWTexture2D<float4> temporal_result = pc.temporal_result;
+    RWImage_r11f_g11f_b10f temporal_result = pc.temporal_result;
     Texture2D<float4> depth = pc.depth;
     Texture2D<float4> normal = pc.normal;
     Texture2D<float4> diffuse = pc.diffuse;
-    RWTexture2D<float4> spatial_output = pc.spatial_output;
+    RWImage_r11f_g11f_b10f spatial_output = pc.spatial_output;
 
     int2 size = int2(pc.width, pc.height);
     int2 pixel_coords = int2(tid.xy);

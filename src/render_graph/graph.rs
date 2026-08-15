@@ -466,25 +466,34 @@ pub(crate) fn live_passes(
     live
 }
 
-/// Is `[start, end)` entirely inside `covered`? `covered` is kept sorted and
-/// merged by [`cover_range`], so a span crossing two entries is impossible —
-/// checking for one containing entry is exact.
+/// Is `[start, end)` entirely inside `covered`? [`cover_range`] keeps the list
+/// sorted and merged, so a span crossing two entries is impossible — the only
+/// entry that can contain `start` is the last one beginning at or before it, and
+/// checking that single entry is exact.
 fn range_covered(covered: &[(u64, u64)], start: u64, end: u64) -> bool {
-    covered.iter().any(|(s, e)| *s <= start && end <= *e)
+    let after = covered.partition_point(|(s, _)| *s <= start);
+    after > 0 && end <= covered[after - 1].1
 }
 
 /// Add `[start, end)` to `covered`, keeping it sorted and merged.
+///
+/// The list is already sorted and disjoint, so the entries this span touches are a
+/// contiguous window: everything ending before `start` stays put, everything
+/// beginning after `end` stays put, and the window between them collapses into one
+/// entry. Both edges are binary searches, which is why this never re-sorts.
+/// Touching counts as overlapping — `[0, 1024)` and `[1024, 2048)` merge — because
+/// they leave no uncovered byte between them.
 fn cover_range(covered: &mut Vec<(u64, u64)>, start: u64, end: u64) {
-    covered.push((start, end));
-    covered.sort_unstable();
-    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(covered.len());
-    for (s, e) in covered.drain(..) {
-        match merged.last_mut() {
-            Some(last) if s <= last.1 => last.1 = last.1.max(e),
-            _ => merged.push((s, e)),
-        }
+    // Ends are ascending (the entries are disjoint), so the first entry reaching
+    // `start` is a partition point, and likewise for the first start past `end`.
+    let lo = covered.partition_point(|(_, e)| *e < start);
+    let hi = covered.partition_point(|(s, _)| *s <= end);
+    if lo == hi {
+        covered.insert(lo, (start, end));
+        return;
     }
-    *covered = merged;
+    covered[lo] = (start.min(covered[lo].0), end.max(covered[hi - 1].1));
+    covered.drain(lo + 1..hi);
 }
 
 fn add_dep_edge(
@@ -1735,10 +1744,21 @@ impl RenderGraph {
     /// occupant usually covers everything and this collapses to a single
     /// predecessor — the behaviour before offset packing existed.
     ///
-    /// ponytail: O(occupants²) per bucket. Real frames put tens of resources in a
-    /// bucket, so this is microseconds; `benches/alias.rs` shows it reaching tens of
-    /// milliseconds around 1024 transients. Reach for an interval tree over the
-    /// bucket's byte ranges only if graphs ever get that big.
+    /// Two things keep the walk off its O(occupants²) worst case. Only strictly
+    /// earlier occupants can be predecessors, and the list is sorted by descending
+    /// `last_pass`, so they are a contiguous suffix — found by binary search instead
+    /// of scanned from the front. And once `covered` spans the whole of `[lo, hi)`
+    /// every remaining candidate would be pruned, so the scan stops there. Both are
+    /// worth far more than the interval set `covered` is built on
+    /// ([`cover_range`] / [`range_covered`]): those only lower the per-candidate
+    /// constant, these remove candidates outright.
+    ///
+    /// ponytail: still O(occupants²) in the worst case. Offset packing deliberately
+    /// makes buckets fat — total work is Σ(occupants²), dominated by the single
+    /// largest bucket — so this is the first thing to feel a very large graph. Real
+    /// frames put tens of resources in a bucket and land in the microseconds. Reach
+    /// for an interval tree over the bucket's byte ranges only if graphs ever get
+    /// big enough to care; see `docs/aliasing_benchmarks.md` for the scaling.
     fn alias_predecessors(
         placements: &HashMap<u32, Placement>,
         resource_usages: &BTreeMap<u32, ResourceLifetimeUsage>,
@@ -1748,6 +1768,10 @@ impl RenderGraph {
             by_bucket.entry(placement.bucket).or_default().push(*res_id);
         }
 
+        // The sort key's leading component, reused by the binary search below so the
+        // two can never disagree about the order.
+        let last_pass_of = |r: &u32| resource_usages.get(r).map_or(0, |u| u.last_pass);
+
         let mut predecessors: HashMap<u32, Vec<u32>> = HashMap::new();
         for occupants in by_bucket.values_mut() {
             if occupants.len() < 2 {
@@ -1755,7 +1779,7 @@ impl RenderGraph {
             }
             // Latest-ending first; the id tiebreak keeps the walk deterministic.
             // The greedy prune below depends on this order.
-            occupants.sort_unstable_by_key(|r| (std::cmp::Reverse(resource_usages.get(r).map_or(0, |u| u.last_pass)), *r));
+            occupants.sort_unstable_by_key(|r| (std::cmp::Reverse(last_pass_of(r)), *r));
 
             let mut covered: Vec<(u64, u64)> = Vec::new();
             for res_id in occupants.iter() {
@@ -1765,14 +1789,18 @@ impl RenderGraph {
                 let mine = placements[res_id];
                 let (lo, hi) = (mine.offset, mine.offset + mine.size);
 
+                // Only strictly-earlier occupants can be predecessors, and the list is
+                // sorted by descending `last_pass`, so they are exactly the suffix
+                // starting here — the prefix would fail the filter on every element.
+                // `res_id` itself is in the prefix (its own `last_pass >= first_pass`),
+                // which is why the walk below needs no self-check.
+                let earlier = occupants.partition_point(|other| last_pass_of(other) >= first_pass);
+
                 covered.clear();
                 let mut prev: Vec<u32> = Vec::new();
-                for other in occupants.iter() {
-                    if other == res_id {
-                        continue;
-                    }
-                    // Strictly earlier only: a resource still live cannot have been
-                    // given bytes this one also holds.
+                for other in occupants[earlier..].iter() {
+                    // The suffix is earlier by construction; this rejects only the
+                    // occupants the usage map never saw (they sort to the very end).
                     if !resource_usages.get(other).is_some_and(|u| u.last_pass < first_pass) {
                         continue;
                     }
@@ -1783,6 +1811,12 @@ impl RenderGraph {
                     }
                     cover_range(&mut covered, start, end);
                     prev.push(*other);
+                    // Every clipped span lies inside `[lo, hi)`, so a merged list that
+                    // is exactly that one interval means the range is fully covered and
+                    // every remaining candidate would be pruned. Nothing left to find.
+                    if covered.len() == 1 && covered[0] == (lo, hi) {
+                        break;
+                    }
                 }
                 if !prev.is_empty() {
                     prev.sort_unstable();
@@ -2556,6 +2590,61 @@ mod tests {
     /// *reachability* in the predecessor graph, not a direct edge — and separately,
     /// that every resource with predecessors actually receives a discarding
     /// barrier, since a chain of edges is worth nothing if no barrier is emitted.
+    /// `cover_range` / `range_covered` are a sorted-disjoint interval set that
+    /// `alias_predecessors` leans on twice: to prune predecessors, and to decide it
+    /// can stop early. Both readers assume the list is sorted, merged and
+    /// non-touching, and both now binary-search it, so a violated invariant would
+    /// silently drop a predecessor rather than fail loudly.
+    ///
+    /// Checked against a naive byte-set model over a small universe: same covered
+    /// bytes, same `range_covered` answer for every sub-range, invariant intact
+    /// after every insertion.
+    #[test]
+    fn interval_set_matches_a_naive_byte_model() {
+        use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+        const N: u64 = 24;
+        for seed in 0..64u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut covered: Vec<(u64, u64)> = Vec::new();
+            let mut model = [false; N as usize];
+
+            for _ in 0..12 {
+                let start = rng.random_range(0..N);
+                let end = rng.random_range(start + 1..=N);
+                cover_range(&mut covered, start, end);
+                for b in &mut model[start as usize..end as usize] {
+                    *b = true;
+                }
+
+                // Sorted, non-empty, and separated by at least one uncovered byte —
+                // touching entries must have been merged, not left adjacent.
+                for w in covered.windows(2) {
+                    assert!(w[0].1 < w[1].0, "seed {seed}: entries {:?} not merged/sorted", covered);
+                }
+                assert!(covered.iter().all(|(s, e)| s < e), "seed {seed}: empty entry in {covered:?}");
+
+                // Same bytes as the model.
+                for (byte, want) in model.iter().enumerate() {
+                    let got = covered.iter().any(|(s, e)| *s <= byte as u64 && (byte as u64) < *e);
+                    assert_eq!(got, *want, "seed {seed}: byte {byte} in {covered:?} vs model");
+                }
+
+                // `range_covered` agrees with the model on every sub-range.
+                for a in 0..N {
+                    for b in a + 1..=N {
+                        let want = model[a as usize..b as usize].iter().all(|c| *c);
+                        assert_eq!(
+                            range_covered(&covered, a, b),
+                            want,
+                            "seed {seed}: range_covered({a},{b}) on {covered:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn random_graphs_order_every_byte_reuse() {
         use crate::render_graph::alias::{self, AliasStrategy};

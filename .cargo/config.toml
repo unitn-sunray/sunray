@@ -13,6 +13,16 @@ SUNRAY_ENABLE_GPUAV = "0"
 SUNRAY_ALIAS_STRATEGY="bucket"
 SUNRAY_ENABLE_NVIDIA_AFTERMATH="0"
 #SUNRAY_ALIAS_STRATEGY="bucket"
+# ReShade, the OBS graphics hook and the GOG Galaxy overlay inject themselves as
+# implicit layers. They are the source of every `vkCmdPushDescriptorSetKHR`
+# VUID-VkWriteDescriptorSet-descriptorType-00331, every
+# uniformAndStorageBuffer{8,16}BitAccess VUID, and the copy-after-dispatch
+# WRITE_AFTER_WRITE hazards in the log — sunray has no push-descriptor call sites and
+# none of its SPIR-V declares those capabilities. With them loaded the device is lost a
+# few seconds in; with this set it survives. Unset it to debug a layer interaction.
+# Note: this does NOT touch the nvoglv64+0x15f9a2 access violation (docs/NVIDIA_BUG_REPORT.md),
+# which reproduces identically either way.
+VK_LOADER_LAYERS_DISABLE = "~implicit~"
 # `-dbg` variants build the dev profile (debug assertions + symbols, slow);
 # the plain ones are release. Nothing else differs.
 [alias]

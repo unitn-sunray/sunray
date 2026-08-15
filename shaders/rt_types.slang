@@ -5,6 +5,28 @@
 
 module rt_types;
 
+// --- Storage-image formats --------------------------------------------------
+// `[vk::image_format("...")]` is SILENTLY DROPPED when the resource is reached
+// through `DescriptorHandle<>` — the emitted `OpTypeImage` keeps format
+// `Unknown` and the module picks up `StorageImageRead/WriteWithoutFormat`, so
+// every image access takes the driver's generic path instead of a typed one.
+// The format has to ride `RWTexture2D`'s third generic parameter instead, which
+// does survive the heap lowering.
+//
+// That parameter is Slang's own `ImageFormat` ordinal, NOT the SPIR-V
+// `ImageFormat` enum — the two orderings diverge after index 2. Verified by
+// probing slangc 1.4.357: 4=rg16f, 5=r11f_g11f_b10f, 7=r16f, 10=rgba8,
+// 16=rgba8_snorm.
+//
+// Each alias must match the `VkFormat` its image view was created with (see
+// `Renderer::build_frame_graph` / `temporal_image_desc` in src/lib.rs) —
+// a mismatch is undefined behaviour, not a validation error.
+public typealias RWImage_r11f_g11f_b10f = RWTexture2D<float4, 0, 5>;  // B10G11R11_UFLOAT_PACK32
+public typealias RWImage_r16f           = RWTexture2D<float,  0, 7>;  // R16_SFLOAT
+public typealias RWImage_rg16f          = RWTexture2D<float2, 0, 4>;  // R16G16_SFLOAT
+public typealias RWImage_rgba8_snorm    = RWTexture2D<float4, 0, 16>; // R8G8B8A8_SNORM
+public typealias RWImage_rgba8          = RWTexture2D<float4, 0, 10>; // R8G8B8A8_UNORM
+
 // --- Per-ray payload --------------------------------------------------------
 public struct RayPayload {
     public float3 emission;
@@ -155,11 +177,11 @@ RaytracingPC {
     // (Slang issue #10671). Same 8-byte footprint, so the rest of the PC
     // layout is unchanged.
     public uint64_t tlas;
-    public DescriptorHandle<RWTexture2D<float4>> raw_color;
-    public DescriptorHandle<RWTexture2D<float>>  depth_img;
-    public DescriptorHandle<RWTexture2D<float4>> normal_img;
-    public DescriptorHandle<RWTexture2D<float4>> diffuse_img;
-    public DescriptorHandle<RWTexture2D<float2>> motion_vec_img;
+    public DescriptorHandle<RWImage_r11f_g11f_b10f> raw_color;
+    public DescriptorHandle<RWImage_r16f>           depth_img;
+    public DescriptorHandle<RWImage_rgba8_snorm>    normal_img;
+    public DescriptorHandle<RWImage_r11f_g11f_b10f> diffuse_img;
+    public DescriptorHandle<RWImage_rg16f>          motion_vec_img;
 
     // BDA pointer instead of a `DescriptorHandle<StructuredBuffer<Matrices>>` —
     // Slang's heap-descriptor lowering miscomputes the storage class when

@@ -62,7 +62,7 @@ function Initialize-Worktree($rev) {
     $main = Join-Path $dir 'examples/window/main.rs'
     $src = Get-Content $main -Raw
 
-    $src = $src -replace 'load_gltf\("[^"]*"\)', 'load_gltf("examples/assets/ReflectionRoom.glb")'
+    $src = $src -replace 'load_gltf\("[^"]*"\)', 'load_gltf("examples/assets/Room.glb")'
     $src = $src -replace 'LogicalSize::new\([^)]*\)', "LogicalSize::new($Width, $Height)"
     if ($src -notmatch '\[heartbeat\]') {
         $src = $src -replace '(?m)^(\s*)self\.last_fps_check = Some\(now\);', "`$1println!(`"[heartbeat] frame {} fps {fps:.1}`", self.frame_count);`r`n`$1self.last_fps_check = Some(now);"
