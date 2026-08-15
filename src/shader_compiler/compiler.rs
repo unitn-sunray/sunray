@@ -200,8 +200,7 @@ mod tests {
     #[test]
     fn push_constant_layouts_match_rust() {
         use crate::vulkan_abstraction::{
-            DenoiseHeapPushConstant, PostprocessPushConstant, RaytracingHeapPushConstant,
-            TemporalAccumulationHeapPushConstant,
+            DenoiseHeapPushConstant, PostprocessPushConstant, RaytracingHeapPushConstant, TemporalAccumulationHeapPushConstant,
         };
         use std::mem::offset_of;
 

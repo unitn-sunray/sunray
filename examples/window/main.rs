@@ -403,9 +403,7 @@ fn wait_on_hard_crash() {
     const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
     unsafe extern "system" {
-        fn SetUnhandledExceptionFilter(
-            filter: unsafe extern "system" fn(*mut c_void) -> i32,
-        ) -> *mut c_void;
+        fn SetUnhandledExceptionFilter(filter: unsafe extern "system" fn(*mut c_void) -> i32) -> *mut c_void;
     }
 
     // `EXCEPTION_POINTERS` begins with `*mut EXCEPTION_RECORD`, which begins with the

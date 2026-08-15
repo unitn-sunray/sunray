@@ -920,10 +920,7 @@ impl RenderGraph {
     ///
     /// The backings are stable for the lifetime of the temporal resource, and
     /// `storage_slot` caches on first call, so this does not churn the heap.
-    pub fn temporal_buffer_storage_slots(
-        &self,
-        exported: &ExportedTemporalResource<RawBuffer>,
-    ) -> [u32; MAX_FRAMES_IN_FLIGHT] {
+    pub fn temporal_buffer_storage_slots(&self, exported: &ExportedTemporalResource<RawBuffer>) -> [u32; MAX_FRAMES_IN_FLIGHT] {
         let imports = &self.temporal_resources[exported.index].imports;
         std::array::from_fn(|i| match &imports[i] {
             GraphResourceImportInfo::Buffer { resource, .. } => resource.storage_slot(),
