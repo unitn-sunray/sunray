@@ -34,9 +34,9 @@ struct GpuVertex {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct EguiPushConstant {
-    screen_size_points: [f32; 2],
-    tex: u32,
-    samp: u32,
+    pub(crate) screen_size_points: [f32; 2],
+    pub(crate) tex: u32,
+    pub(crate) samp: u32,
 }
 
 struct EguiTexture {
